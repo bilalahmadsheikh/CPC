@@ -1,0 +1,18 @@
+# WhatsApp Bot Dependencies
+# Python 3.11+
+
+# Web Framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Supabase Client
+supabase==2.11.0
+
+# HTTP Client
+httpx==0.28.1
+
+# Environment Variables
+python-dotenv==1.0.1
+
+# Production ASGI Server
+gunicorn==23.0.0
