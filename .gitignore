@@ -24,6 +24,8 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+ngrok.exe
+
 
 # Virtual environments
 venv/
