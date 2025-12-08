@@ -1,6 +1,7 @@
 """
-WhatsApp Button Bot - Production Ready
+WhatsApp Button Bot - Performance Optimized
 FastAPI + Supabase + Railway Deployment
+v2.1.0 - Performance Edition
 """
 
 import os
@@ -9,11 +10,13 @@ import hashlib
 import hmac
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
+from functools import lru_cache
+import asyncio
 
 import httpx
-from fastapi import FastAPI, Request, Query, HTTPException, Depends
+from fastapi import FastAPI, Request, Query, HTTPException, BackgroundTasks
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -40,15 +43,17 @@ class Config:
     WHATSAPP_ACCESS_TOKEN: str = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
     WHATSAPP_PHONE_NUMBER_ID: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
     WHATSAPP_VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "cpc")
-    WHATSAPP_APP_SECRET: str = os.getenv("WHATSAPP_APP_SECRET", "")  # For signature verification
+    WHATSAPP_APP_SECRET: str = os.getenv("WHATSAPP_APP_SECRET", "")
     
     # Supabase
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
     
-    # Rate Limiting
-    RATE_LIMIT_REQUESTS: int = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))  # requests per window
-    RATE_LIMIT_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))  # window size
+    # Performance Settings
+    CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 minutes
+    RATE_LIMIT_REQUESTS: int = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
+    RATE_LIMIT_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+    ENABLE_MESSAGE_LOGGING: bool = os.getenv("ENABLE_MESSAGE_LOGGING", "false").lower() == "true"
     
     # App Settings
     DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
@@ -56,7 +61,7 @@ class Config:
     
     @classmethod
     def validate(cls) -> list[str]:
-        """Validate required configuration. Returns list of missing vars."""
+        """Validate required configuration."""
         missing = []
         if not cls.WHATSAPP_ACCESS_TOKEN:
             missing.append("WHATSAPP_ACCESS_TOKEN")
@@ -75,6 +80,7 @@ config = Config()
 # SUPABASE CLIENT
 # ============================================================
 supabase: Optional[Client] = None
+_http_client: Optional[httpx.AsyncClient] = None
 
 def get_supabase() -> Client:
     global supabase
@@ -91,10 +97,59 @@ def get_supabase() -> Client:
     return supabase
 
 
+def get_http_client() -> httpx.AsyncClient:
+    """Get reusable HTTP client for better connection pooling."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=30,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+        )
+    return _http_client
+
+
 def is_supabase_configured() -> bool:
     """Check if Supabase is properly configured."""
     return bool(config.SUPABASE_URL and config.SUPABASE_SERVICE_KEY)
 
+
+# ============================================================
+# IN-MEMORY CACHE
+# ============================================================
+class Cache:
+    """Simple in-memory cache with TTL."""
+    
+    def __init__(self):
+        self._cache: Dict[str, tuple[Any, float]] = {}
+    
+    def get(self, key: str) -> Optional[Any]:
+        """Get value from cache if not expired."""
+        if key in self._cache:
+            value, expires_at = self._cache[key]
+            if datetime.now().timestamp() < expires_at:
+                return value
+            else:
+                del self._cache[key]
+        return None
+    
+    def set(self, key: str, value: Any, ttl_seconds: int = None):
+        """Set value in cache with TTL."""
+        if ttl_seconds is None:
+            ttl_seconds = config.CACHE_TTL_SECONDS
+        expires_at = datetime.now().timestamp() + ttl_seconds
+        self._cache[key] = (value, expires_at)
+    
+    def delete(self, key: str):
+        """Delete key from cache."""
+        if key in self._cache:
+            del self._cache[key]
+    
+    def clear(self):
+        """Clear all cache."""
+        self._cache.clear()
+
+
+cache = Cache()
 
 # ============================================================
 # BUTTON / LIST IDs
@@ -112,25 +167,33 @@ ITEM_FRIES = "ITEM_FRIES"
 
 
 # ============================================================
-# DATABASE OPERATIONS
+# DATABASE OPERATIONS (OPTIMIZED)
 # ============================================================
 class Database:
-    """Database operations using Supabase."""
+    """Optimized database operations using Supabase."""
     
     @staticmethod
     async def get_or_create_user(wa_id: str, phone: str = None) -> dict:
-        """Get existing user or create new one."""
+        """Get existing user or create new one (cached)."""
+        cache_key = f"user:{wa_id}"
+        cached_user = cache.get(cache_key)
+        
+        if cached_user:
+            # Update last_active in background (non-blocking)
+            asyncio.create_task(Database._update_user_activity(wa_id))
+            return cached_user
+        
         db = get_supabase()
         
         # Try to get existing user
         result = db.table("users").select("*").eq("wa_id", wa_id).execute()
         
         if result.data:
-            # Update last_active_at
-            db.table("users").update({
-                "last_active_at": datetime.now(timezone.utc).isoformat()
-            }).eq("wa_id", wa_id).execute()
-            return result.data[0]
+            user = result.data[0]
+            cache.set(cache_key, user, 600)  # Cache for 10 minutes
+            # Update last_active in background
+            asyncio.create_task(Database._update_user_activity(wa_id))
+            return user
         
         # Create new user
         new_user = {
@@ -140,44 +203,89 @@ class Database:
             "last_active_at": datetime.now(timezone.utc).isoformat(),
         }
         result = db.table("users").insert(new_user).execute()
+        user = result.data[0] if result.data else new_user
+        cache.set(cache_key, user, 600)
         logger.info(f"New user created: {wa_id}")
-        return result.data[0] if result.data else new_user
+        return user
+    
+    @staticmethod
+    async def _update_user_activity(wa_id: str):
+        """Update user last_active in background."""
+        try:
+            db = get_supabase()
+            db.table("users").update({
+                "last_active_at": datetime.now(timezone.utc).isoformat()
+            }).eq("wa_id", wa_id).execute()
+        except Exception as e:
+            logger.error(f"Failed to update user activity: {e}")
 
     @staticmethod
     async def is_user_blocked(wa_id: str) -> bool:
-        """Check if user is blocked."""
+        """Check if user is blocked (cached)."""
+        cache_key = f"blocked:{wa_id}"
+        cached_blocked = cache.get(cache_key)
+        
+        if cached_blocked is not None:
+            return cached_blocked
+        
         db = get_supabase()
         result = db.table("users").select("is_blocked").eq("wa_id", wa_id).execute()
+        
+        is_blocked = False
         if result.data:
-            return result.data[0].get("is_blocked", False)
-        return False
+            is_blocked = result.data[0].get("is_blocked", False)
+        
+        cache.set(cache_key, is_blocked, 300)  # Cache for 5 minutes
+        return is_blocked
 
     @staticmethod
     async def already_processed(message_id: str) -> bool:
-        """Check if message was already processed (deduplication)."""
+        """Check if message was already processed (in-memory cache first)."""
+        cache_key = f"processed:{message_id}"
+        
+        if cache.get(cache_key):
+            return True
+        
         db = get_supabase()
         result = db.table("processed_messages").select("id").eq("message_id", message_id).execute()
-        return len(result.data) > 0
+        
+        is_processed = len(result.data) > 0
+        if is_processed:
+            cache.set(cache_key, True, 3600)  # Cache for 1 hour
+        
+        return is_processed
 
     @staticmethod
     async def mark_processed(message_id: str, wa_id: str, message_type: str = None):
-        """Mark message as processed."""
-        db = get_supabase()
-        db.table("processed_messages").insert({
-            "message_id": message_id,
-            "wa_id": wa_id,
-            "message_type": message_type,
-            "processed_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        """Mark message as processed (async in background)."""
+        cache_key = f"processed:{message_id}"
+        cache.set(cache_key, True, 3600)
+        
+        # Insert to database in background
+        asyncio.create_task(Database._insert_processed_message(message_id, wa_id, message_type))
+    
+    @staticmethod
+    async def _insert_processed_message(message_id: str, wa_id: str, message_type: str):
+        """Insert processed message to database."""
+        try:
+            db = get_supabase()
+            db.table("processed_messages").insert({
+                "message_id": message_id,
+                "wa_id": wa_id,
+                "message_type": message_type,
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception as e:
+            logger.error(f"Failed to mark message as processed: {e}")
 
     @staticmethod
     async def create_order(wa_id: str, customer_phone: str, item_id: str, item_name: str, item_price: int = None) -> dict:
         """Create a new order."""
         db = get_supabase()
         
-        # Get user_id
-        user_result = db.table("users").select("id").eq("wa_id", wa_id).execute()
-        user_id = user_result.data[0]["id"] if user_result.data else None
+        # Get user_id from cache or database
+        user = await Database.get_or_create_user(wa_id, customer_phone)
+        user_id = user.get("id")
         
         order_data = {
             "user_id": user_id,
@@ -191,11 +299,21 @@ class Database:
         }
         result = db.table("orders").insert(order_data).execute()
         logger.info(f"Order created for {wa_id}: {item_name}")
+        
+        # Invalidate order history cache
+        cache.delete(f"order_history:{wa_id}")
+        
         return result.data[0] if result.data else order_data
 
     @staticmethod
     async def get_order_history(wa_id: str, limit: int = 10) -> list:
-        """Get order history for a user."""
+        """Get order history for a user (cached)."""
+        cache_key = f"order_history:{wa_id}"
+        cached_orders = cache.get(cache_key)
+        
+        if cached_orders:
+            return cached_orders
+        
         db = get_supabase()
         result = db.table("orders")\
             .select("order_number, item_name, status, created_at")\
@@ -203,24 +321,45 @@ class Database:
             .order("created_at", desc=True)\
             .limit(limit)\
             .execute()
-        return result.data
+        
+        orders = result.data
+        cache.set(cache_key, orders, 60)  # Cache for 1 minute
+        return orders
 
     @staticmethod
     async def get_menu_items() -> list:
-        """Get available menu items."""
+        """Get available menu items (heavily cached)."""
+        cache_key = "menu_items:all"
+        cached_menu = cache.get(cache_key)
+        
+        if cached_menu:
+            return cached_menu
+        
         db = get_supabase()
         result = db.table("menu_items")\
             .select("*")\
             .eq("is_available", True)\
             .order("sort_order")\
             .execute()
-        return result.data
+        
+        menu_items = result.data
+        cache.set(cache_key, menu_items, 600)  # Cache for 10 minutes
+        return menu_items
 
     @staticmethod
     async def log_message(wa_id: str, direction: str, message_type: str, content: dict, status: str = "success", error: str = None):
-        """Log message for debugging and analytics."""
-        db = get_supabase()
+        """Log message (only if enabled, async in background)."""
+        if not config.ENABLE_MESSAGE_LOGGING:
+            return
+        
+        # Log to database in background (non-blocking)
+        asyncio.create_task(Database._insert_message_log(wa_id, direction, message_type, content, status, error))
+    
+    @staticmethod
+    async def _insert_message_log(wa_id: str, direction: str, message_type: str, content: dict, status: str, error: str):
+        """Insert message log to database."""
         try:
+            db = get_supabase()
             db.table("message_logs").insert({
                 "wa_id": wa_id,
                 "direction": direction,
@@ -235,61 +374,68 @@ class Database:
 
 
 # ============================================================
-# RATE LIMITING
+# RATE LIMITING (OPTIMIZED WITH IN-MEMORY)
 # ============================================================
 class RateLimiter:
-    """Rate limiter using Supabase."""
+    """Optimized rate limiter using in-memory cache + Supabase backup."""
+    
+    _rate_limits: Dict[str, tuple[int, float]] = {}  # {wa_id: (count, window_start_timestamp)}
     
     @staticmethod
     async def check_rate_limit(wa_id: str) -> tuple[bool, int]:
         """
-        Check if user is within rate limit.
+        Check if user is within rate limit (in-memory first for speed).
         Returns (is_allowed, remaining_requests)
         """
-        db = get_supabase()
-        window_start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-        window_start_str = window_start.isoformat()
+        now = datetime.now(timezone.utc)
+        window_start = now.replace(second=0, microsecond=0)
+        window_timestamp = window_start.timestamp()
         
-        # Try to get existing rate limit record
-        result = db.table("rate_limits")\
-            .select("request_count")\
-            .eq("wa_id", wa_id)\
-            .eq("window_start", window_start_str)\
-            .execute()
-        
-        if result.data:
-            current_count = result.data[0]["request_count"]
-            if current_count >= config.RATE_LIMIT_REQUESTS:
+        # Check in-memory first
+        if wa_id in RateLimiter._rate_limits:
+            count, stored_window = RateLimiter._rate_limits[wa_id]
+            
+            # Check if window expired
+            if stored_window < window_timestamp:
+                # New window
+                RateLimiter._rate_limits[wa_id] = (1, window_timestamp)
+                return True, config.RATE_LIMIT_REQUESTS - 1
+            
+            # Same window
+            if count >= config.RATE_LIMIT_REQUESTS:
                 return False, 0
             
-            # Increment counter
-            db.table("rate_limits")\
-                .update({"request_count": current_count + 1})\
-                .eq("wa_id", wa_id)\
-                .eq("window_start", window_start_str)\
-                .execute()
-            
-            return True, config.RATE_LIMIT_REQUESTS - current_count - 1
+            RateLimiter._rate_limits[wa_id] = (count + 1, window_timestamp)
+            return True, config.RATE_LIMIT_REQUESTS - count - 1
         
-        # Create new record
-        try:
-            db.table("rate_limits").insert({
-                "wa_id": wa_id,
-                "window_start": window_start_str,
-                "request_count": 1,
-            }).execute()
-        except Exception:
-            # Handle race condition - record might have been created
-            pass
+        # First request in this window
+        RateLimiter._rate_limits[wa_id] = (1, window_timestamp)
+        
+        # Sync to database in background (for persistence across restarts)
+        asyncio.create_task(RateLimiter._sync_to_db(wa_id, window_start.isoformat(), 1))
         
         return True, config.RATE_LIMIT_REQUESTS - 1
+    
+    @staticmethod
+    async def _sync_to_db(wa_id: str, window_start: str, count: int):
+        """Sync rate limit to database in background."""
+        try:
+            db = get_supabase()
+            # Upsert (update or insert)
+            db.table("rate_limits").upsert({
+                "wa_id": wa_id,
+                "window_start": window_start,
+                "request_count": count,
+            }).execute()
+        except Exception:
+            pass  # Silently fail, in-memory is primary
 
 
 # ============================================================
-# WHATSAPP API HELPERS
+# WHATSAPP API HELPERS (OPTIMIZED)
 # ============================================================
 class WhatsAppAPI:
-    """WhatsApp Cloud API wrapper."""
+    """Optimized WhatsApp Cloud API wrapper with connection pooling."""
     
     BASE_URL = "https://graph.facebook.com/v21.0"
     
@@ -299,7 +445,7 @@ class WhatsAppAPI:
     
     @classmethod
     async def send(cls, payload: dict) -> dict:
-        """Send a message via WhatsApp API."""
+        """Send a message via WhatsApp API (reuses HTTP client)."""
         if not config.WHATSAPP_ACCESS_TOKEN:
             raise RuntimeError("WHATSAPP_ACCESS_TOKEN is not set")
         
@@ -308,18 +454,18 @@ class WhatsAppAPI:
             "Content-Type": "application/json",
         }
         
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                cls._get_url("messages"),
-                headers=headers,
-                json=payload
-            )
-            
-            if response.status_code >= 400:
-                logger.error(f"WhatsApp API error: {response.status_code} - {response.text}")
-                response.raise_for_status()
-            
-            return response.json()
+        client = get_http_client()
+        response = await client.post(
+            cls._get_url("messages"),
+            headers=headers,
+            json=payload
+        )
+        
+        if response.status_code >= 400:
+            logger.error(f"WhatsApp API error: {response.status_code} - {response.text}")
+            response.raise_for_status()
+        
+        return response.json()
     
     @classmethod
     async def send_text(cls, to: str, text: str) -> dict:
@@ -331,15 +477,16 @@ class WhatsAppAPI:
             "text": {"body": text},
         }
         result = await cls.send(payload)
-        await Database.log_message(to, "outbound", "text", {"body": text})
+        
+        # Log in background if enabled
+        if config.ENABLE_MESSAGE_LOGGING:
+            asyncio.create_task(Database.log_message(to, "outbound", "text", {"body": text}))
+        
         return result
     
     @classmethod
     async def send_buttons(cls, to: str, body_text: str, buttons: list[dict]) -> dict:
-        """
-        Send interactive buttons (max 3).
-        buttons: [{"id": "...", "title": "..."}]
-        """
+        """Send interactive buttons (max 3)."""
         payload = {
             "messaging_product": "whatsapp",
             "to": to,
@@ -350,13 +497,17 @@ class WhatsAppAPI:
                 "action": {
                     "buttons": [
                         {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
-                        for b in buttons[:3]  # Max 3 buttons
+                        for b in buttons[:3]
                     ]
                 },
             },
         }
         result = await cls.send(payload)
-        await Database.log_message(to, "outbound", "buttons", payload["interactive"])
+        
+        # Log in background if enabled
+        if config.ENABLE_MESSAGE_LOGGING:
+            asyncio.create_task(Database.log_message(to, "outbound", "buttons", payload["interactive"]))
+        
         return result
     
     @classmethod
@@ -376,7 +527,11 @@ class WhatsAppAPI:
             },
         }
         result = await cls.send(payload)
-        await Database.log_message(to, "outbound", "list", payload["interactive"])
+        
+        # Log in background if enabled
+        if config.ENABLE_MESSAGE_LOGGING:
+            asyncio.create_task(Database.log_message(to, "outbound", "list", payload["interactive"]))
+        
         return result
     
     @staticmethod
@@ -392,7 +547,6 @@ class WhatsAppAPI:
             hashlib.sha256
         ).hexdigest()
         
-        # Signature comes as "sha256=..."
         if signature.startswith("sha256="):
             signature = signature[7:]
         
@@ -421,18 +575,16 @@ class BotFlows:
     @staticmethod
     async def show_menu(to: str):
         """Show menu with items."""
-        # Fetch menu from database
         items = await Database.get_menu_items()
         
         if items:
             lines = ["🧾 *Menu*\n"]
             for item in items:
-                price_display = f"Rs {item['price'] // 100}"  # Convert from paisa
+                price_display = f"Rs {item['price'] // 100}"
                 lines.append(f"• {item['name']} — {price_display}")
             lines.append("\nTap *Order* to place an order.")
             menu_text = "\n".join(lines)
         else:
-            # Fallback to hardcoded menu
             menu_text = (
                 "🧾 *Menu*\n"
                 "• Zinger Burger — Rs 450\n"
@@ -454,7 +606,6 @@ class BotFlows:
     @staticmethod
     async def show_order_list(to: str):
         """Show order selection list."""
-        # Fetch menu from database
         items = await Database.get_menu_items()
         
         if items:
@@ -467,7 +618,6 @@ class BotFlows:
                     "description": price_display,
                 })
         else:
-            # Fallback
             rows = [
                 {"id": ITEM_ZINGER, "title": "Zinger Burger", "description": "Rs 450"},
                 {"id": ITEM_PIZZA, "title": "Pizza Slice", "description": "Rs 350"},
@@ -526,7 +676,7 @@ class BotFlows:
             order_num = order.get("order_number", "N/A")
             item_name = order.get("item_name", "Unknown")
             status = order.get("status", "unknown")
-            created = order.get("created_at", "")[:10]  # Just the date
+            created = order.get("created_at", "")[:10]
             
             status_emoji = {
                 "placed": "🆕",
@@ -574,7 +724,6 @@ def extract_message(data: dict) -> Optional[dict]:
             "type": msg_type,
         }
         
-        # Interactive reply (button or list)
         if msg_type == "interactive":
             interactive = msg.get("interactive", {})
             itype = interactive.get("type")
@@ -592,13 +741,11 @@ def extract_message(data: dict) -> Optional[dict]:
             
             return result
         
-        # Plain text
         if msg_type == "text":
             result["kind"] = "text"
             result["text"] = msg.get("text", {}).get("body", "")
             return result
         
-        # Other types (image, audio, etc.)
         result["kind"] = "other"
         return result
     
@@ -614,7 +761,7 @@ def extract_message(data: dict) -> Optional[dict]:
 async def lifespan(app: FastAPI):
     """App lifespan events."""
     # Startup
-    logger.info("Starting WhatsApp Bot...")
+    logger.info("Starting WhatsApp Bot (Performance Optimized)...")
     
     missing = config.validate()
     if missing:
@@ -623,35 +770,35 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("✅ Configuration validated successfully")
     
-    # Test Supabase connection (only if configured)
+    # Test Supabase connection
     if is_supabase_configured():
         try:
             db = get_supabase()
-            # Simple connectivity test
             db.table("users").select("id").limit(1).execute()
             logger.info("✅ Supabase connection established")
         except Exception as e:
             logger.warning(f"⚠️ Supabase connection test failed: {e}")
-            logger.warning("Database features may not work - check your SUPABASE_URL and SUPABASE_SERVICE_KEY")
     else:
         logger.warning("⚠️ Supabase not configured - database features disabled")
     
     logger.info(f"🚀 WhatsApp Bot started in {config.ENVIRONMENT} mode")
+    logger.info(f"⚡ Performance optimizations: Caching enabled, Message logging: {config.ENABLE_MESSAGE_LOGGING}")
     
     yield
     
     # Shutdown
     logger.info("WhatsApp Bot shutting down")
+    if _http_client:
+        await _http_client.aclose()
 
 
 app = FastAPI(
     title="WhatsApp Button Bot",
-    description="Production-ready WhatsApp bot with Supabase",
-    version="2.0.0",
+    description="Production-ready WhatsApp bot with Supabase (Performance Optimized)",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
-# CORS middleware (adjust origins for your frontend if needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -669,8 +816,9 @@ async def root():
     """Root endpoint."""
     return {
         "name": "WhatsApp Button Bot",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
+        "optimizations": "enabled"
     }
 
 
@@ -681,10 +829,10 @@ async def health():
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "environment": config.ENVIRONMENT,
+        "version": "2.1.0",
         "checks": {}
     }
     
-    # Check Supabase connection
     try:
         db = get_supabase()
         db.table("users").select("id").limit(1).execute()
@@ -692,17 +840,13 @@ async def health():
     except Exception as e:
         health_status["checks"]["database"] = f"error: {str(e)}"
         health_status["status"] = "degraded"
-        logger.warning(f"Health check - database error: {e}")
     
-    # Check WhatsApp config
     if config.WHATSAPP_ACCESS_TOKEN and config.WHATSAPP_PHONE_NUMBER_ID:
         health_status["checks"]["whatsapp_config"] = "ok"
     else:
         health_status["checks"]["whatsapp_config"] = "missing credentials"
         health_status["status"] = "degraded"
     
-    # Always return 200 for Railway health checks - app is running even if degraded
-    # This prevents deployment failures due to missing env vars during initial setup
     return JSONResponse(health_status, status_code=200)
 
 
@@ -723,27 +867,23 @@ async def verify_webhook(
 
 
 @app.post("/webhook/whatsapp")
-async def webhook(request: Request):
-    """Handle incoming WhatsApp messages."""
-    # Get raw body for signature verification
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    """Handle incoming WhatsApp messages (optimized)."""
     body = await request.body()
     
-    # Verify signature (if app secret is configured)
+    # Verify signature (if configured)
     signature = request.headers.get("X-Hub-Signature-256", "")
     if config.WHATSAPP_APP_SECRET and not WhatsAppAPI.verify_signature(body, signature):
         logger.warning("Invalid webhook signature")
         return JSONResponse({"status": "invalid_signature"}, status_code=401)
     
-    # Parse JSON
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
         return JSONResponse({"status": "invalid_json"}, status_code=400)
     
-    # Extract message
     msg = extract_message(data)
     
-    # Always return 200 to Meta to avoid redelivery storms
     if not msg or not msg.get("id") or not msg.get("from"):
         return JSONResponse({"status": "ignored"}, status_code=200)
     
@@ -751,30 +891,32 @@ async def webhook(request: Request):
     wa_id = msg["from"]
     msg_id = msg["id"]
     
-    # Log inbound message
-    await Database.log_message(wa_id, "inbound", msg.get("kind", "unknown"), msg)
-    
-    # Deduplication check
+    # Deduplication check (fast in-memory)
     if await Database.already_processed(msg_id):
         logger.debug(f"Duplicate message ignored: {msg_id}")
         return JSONResponse({"status": "duplicate"}, status_code=200)
     
+    # Mark as processed immediately (in-memory + background DB sync)
     await Database.mark_processed(msg_id, wa_id, msg.get("kind"))
     
-    # Check if user is blocked
+    # Check if user is blocked (cached)
     if await Database.is_user_blocked(wa_id):
         logger.info(f"Blocked user attempted contact: {wa_id}")
         return JSONResponse({"status": "blocked"}, status_code=200)
     
-    # Rate limiting
+    # Rate limiting (in-memory for speed)
     is_allowed, remaining = await RateLimiter.check_rate_limit(wa_id)
     if not is_allowed:
         logger.warning(f"Rate limit exceeded for {wa_id}")
         await BotFlows.show_rate_limited(to)
         return JSONResponse({"status": "rate_limited"}, status_code=200)
     
-    # Get or create user
+    # Get or create user (cached)
     await Database.get_or_create_user(wa_id, to)
+    
+    # Log message in background if enabled
+    if config.ENABLE_MESSAGE_LOGGING:
+        background_tasks.add_task(Database.log_message, wa_id, "inbound", msg.get("kind", "unknown"), msg)
     
     try:
         # Handle text messages
@@ -794,7 +936,6 @@ async def webhook(request: Request):
             elif text in ("contact", "help", "support"):
                 await BotFlows.show_contact(to)
             else:
-                # Default: show home
                 await BotFlows.show_home(to)
             
             return JSONResponse({"status": "ok"}, status_code=200)
@@ -825,11 +966,10 @@ async def webhook(request: Request):
             rid = msg["reply_id"]
             title = msg.get("title", "Item")
             
-            # Get menu items from database
+            # Get menu items (cached)
             items = await Database.get_menu_items()
             item_map = {item["item_id"]: item for item in items}
             
-            # Fallback map
             if not item_map:
                 item_map = {
                     ITEM_ZINGER: {"name": "Zinger Burger", "price": 45000, "item_id": ITEM_ZINGER},
@@ -862,7 +1002,7 @@ async def webhook(request: Request):
             
             return JSONResponse({"status": "ok"}, status_code=200)
         
-        # Handle other message types (images, audio, etc.)
+        # Handle other message types
         await WhatsAppAPI.send_text(
             to,
             "I can only process text messages and button selections right now. "
@@ -873,13 +1013,13 @@ async def webhook(request: Request):
     
     except Exception as e:
         logger.exception(f"Error handling message from {wa_id}: {e}")
-        await Database.log_message(wa_id, "inbound", msg.get("kind"), msg, status="error", error=str(e))
-        # Still return 200 to avoid Meta retries
+        if config.ENABLE_MESSAGE_LOGGING:
+            background_tasks.add_task(Database.log_message, wa_id, "inbound", msg.get("kind"), msg, status="error", error=str(e))
         return JSONResponse({"status": "error"}, status_code=200)
 
 
 # ============================================================
-# ADMIN ENDPOINTS (optional - add authentication in production)
+# ADMIN ENDPOINTS
 # ============================================================
 @app.get("/admin/stats")
 async def get_stats():
@@ -890,7 +1030,6 @@ async def get_stats():
         users_result = db.table("users").select("id", count="exact").execute()
         orders_result = db.table("orders").select("id", count="exact").execute()
         
-        # Orders today
         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         orders_today = db.table("orders")\
             .select("id", count="exact")\
@@ -902,10 +1041,19 @@ async def get_stats():
             "total_orders": orders_result.count or 0,
             "orders_today": orders_today.count or 0,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "cache_enabled": True,
+            "message_logging": config.ENABLE_MESSAGE_LOGGING,
         }
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/cache/clear")
+async def clear_cache():
+    """Clear all cached data."""
+    cache.clear()
+    return {"status": "cache_cleared", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 if __name__ == "__main__":

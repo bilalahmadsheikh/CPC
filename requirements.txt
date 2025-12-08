@@ -1,4 +1,4 @@
-# WhatsApp Bot Dependencies
+# WhatsApp Bot Dependencies - Performance Optimized
 # Python 3.11+
 
 # Web Framework
