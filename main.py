@@ -564,7 +564,7 @@ class BotFlows:
         """Show home menu."""
         await WhatsAppAPI.send_buttons(
             to,
-            "Welcome! 👋 What would you like to do?",
+            "Welcome!!👋 What would you like to do?",
             [
                 {"id": BTN_MENU, "title": "📋 Menu"},
                 {"id": BTN_ORDER, "title": "🛒 Order"},
