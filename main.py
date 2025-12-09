@@ -292,28 +292,30 @@ class Database:
     @staticmethod
     async def create_order_from_catalogue(wa_id: str, customer_phone: str, order_data: dict) -> dict:
         """Create order from Meta catalogue purchase."""
-        import secrets
-        
         db = get_supabase()
         
         # Get user_id from cache or database
         user = await Database.get_or_create_user(wa_id, customer_phone)
         user_id = user.get("id")
         
-        # Generate unique order number
-        order_number = f"ORD-{datetime.now():%Y%m%d}-{secrets.token_hex(4).upper()}"
-        
         # Extract order details from Meta catalogue webhook
         items = order_data.get("items", [])
         total_amount = sum(item.get("item_price", 0) for item in items)
+        
+        # For catalogue orders with multiple items
+        # Set item_id and item_name to generic values since we store details in items JSONB
+        item_display = f"{len(items)} item(s) from catalogue" if items else "Catalogue order"
         
         order_record = {
             "user_id": user_id,
             "wa_id": wa_id,
             "customer_phone": customer_phone,
-            "order_number": order_number,
+            # Don't set order_number - let database auto-generate (SERIAL)
+            "item_id": "CAT_ORDER",  # Generic ID for catalogue orders
+            "item_name": item_display,  # Display name
             "items": items,  # Store as JSONB
             "total_amount": total_amount,
+            "quantity": len(items) if items else 1,
             "status": "placed",
             "order_source": "meta_catalogue",
             "meta_order_id": order_data.get("order_id"),
@@ -321,35 +323,36 @@ class Database:
         }
         
         result = db.table("orders").insert(order_record).execute()
+        
+        # Get order number from result
+        order = result.data[0] if result.data else order_record
+        order_number = order.get("order_number", "N/A")
+        
         logger.info(f"Catalogue order created: {order_number} for {wa_id}")
         
         # Invalidate order history cache
         cache.delete(f"order_history:{wa_id}")
         
-        return result.data[0] if result.data else order_record
+        return order
 
     @staticmethod
     async def create_order(wa_id: str, customer_phone: str, item_id: str, item_name: str, item_price: int = None) -> dict:
         """Create a new order (legacy method)."""
-        import secrets
-        
         db = get_supabase()
         
         # Get user_id from cache or database
         user = await Database.get_or_create_user(wa_id, customer_phone)
         user_id = user.get("id")
         
-        # Generate unique order number
-        order_number = f"ORD-{datetime.now():%Y%m%d}-{secrets.token_hex(4).upper()}"
-        
         order_data = {
             "user_id": user_id,
             "wa_id": wa_id,
             "customer_phone": customer_phone,
-            "order_number": order_number,
+            # Don't set order_number - let database auto-generate (SERIAL)
             "item_id": item_id,
             "item_name": item_name,
             "item_price": item_price,
+            "quantity": 1,
             "status": "placed",
             "order_source": "bot_menu",
             "created_at": datetime.now(timezone.utc).isoformat(),
