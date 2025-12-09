@@ -1,7 +1,7 @@
 """
 WhatsApp Button Bot - Performance Optimized
-FastAPI + Supabase + Railway Deployment
-v2.1.0 - Performance Edition
+FastAPI + Supabase + Railway Deployment + Meta Catalogue Integration
+v2.2.0 - Meta Catalogue Edition
 """
 
 import os
@@ -44,6 +44,7 @@ class Config:
     WHATSAPP_PHONE_NUMBER_ID: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
     WHATSAPP_VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "cpc")
     WHATSAPP_APP_SECRET: str = os.getenv("WHATSAPP_APP_SECRET", "")
+    WHATSAPP_BUSINESS_ID: str = os.getenv("WHATSAPP_BUSINESS_ID", "")  # NEW: For catalogue
     
     # Supabase
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
@@ -71,6 +72,11 @@ class Config:
             missing.append("SUPABASE_URL")
         if not cls.SUPABASE_SERVICE_KEY:
             missing.append("SUPABASE_SERVICE_KEY")
+        
+        # Log validation result without exposing values
+        if not missing:
+            logger.info("✅ All credentials validated (values masked)")
+        
         return missing
 
 
@@ -92,8 +98,8 @@ def get_supabase() -> Client:
             supabase = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_KEY)
             logger.info("Supabase client initialized")
         except Exception as e:
-            logger.error(f"Failed to create Supabase client: {e}")
-            raise
+            logger.error(f"Failed to create Supabase client: {type(e).__name__}")
+            raise RuntimeError("Database connection failed") from e
     return supabase
 
 
@@ -154,12 +160,17 @@ cache = Cache()
 # ============================================================
 # BUTTON / LIST IDs
 # ============================================================
+BTN_VIEW_STORE = "BTN_VIEW_STORE"
+BTN_HISTORY = "BTN_HISTORY"
+BTN_FAQ = "BTN_FAQ"
+BTN_ABOUT_US = "BTN_ABOUT_US"
+BTN_BACK_HOME = "BTN_BACK_HOME"
+
+# Legacy buttons (keeping for backwards compatibility)
 BTN_MENU = "BTN_MENU"
 BTN_ORDER = "BTN_ORDER"
 BTN_MORE = "BTN_MORE"
-BTN_BACK_HOME = "BTN_BACK_HOME"
 BTN_CONTACT = "BTN_CONTACT"
-BTN_HISTORY = "BTN_HISTORY"
 
 ITEM_ZINGER = "ITEM_ZINGER"
 ITEM_PIZZA = "ITEM_PIZZA"
@@ -217,7 +228,7 @@ class Database:
                 "last_active_at": datetime.now(timezone.utc).isoformat()
             }).eq("wa_id", wa_id).execute()
         except Exception as e:
-            logger.error(f"Failed to update user activity: {e}")
+            logger.error(f"Failed to update user activity: {type(e).__name__}")
 
     @staticmethod
     async def is_user_blocked(wa_id: str) -> bool:
@@ -276,25 +287,71 @@ class Database:
                 "processed_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
         except Exception as e:
-            logger.error(f"Failed to mark message as processed: {e}")
+            logger.error(f"Failed to mark message as processed: {type(e).__name__}")
 
     @staticmethod
-    async def create_order(wa_id: str, customer_phone: str, item_id: str, item_name: str, item_price: int = None) -> dict:
-        """Create a new order."""
+    async def create_order_from_catalogue(wa_id: str, customer_phone: str, order_data: dict) -> dict:
+        """Create order from Meta catalogue purchase."""
+        import secrets
+        
         db = get_supabase()
         
         # Get user_id from cache or database
         user = await Database.get_or_create_user(wa_id, customer_phone)
         user_id = user.get("id")
         
+        # Generate unique order number
+        order_number = f"ORD-{datetime.now():%Y%m%d}-{secrets.token_hex(4).upper()}"
+        
+        # Extract order details from Meta catalogue webhook
+        items = order_data.get("items", [])
+        total_amount = sum(item.get("item_price", 0) for item in items)
+        
+        order_record = {
+            "user_id": user_id,
+            "wa_id": wa_id,
+            "customer_phone": customer_phone,
+            "order_number": order_number,
+            "items": items,  # Store as JSONB
+            "total_amount": total_amount,
+            "status": "placed",
+            "order_source": "meta_catalogue",
+            "meta_order_id": order_data.get("order_id"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        
+        result = db.table("orders").insert(order_record).execute()
+        logger.info(f"Catalogue order created: {order_number} for {wa_id}")
+        
+        # Invalidate order history cache
+        cache.delete(f"order_history:{wa_id}")
+        
+        return result.data[0] if result.data else order_record
+
+    @staticmethod
+    async def create_order(wa_id: str, customer_phone: str, item_id: str, item_name: str, item_price: int = None) -> dict:
+        """Create a new order (legacy method)."""
+        import secrets
+        
+        db = get_supabase()
+        
+        # Get user_id from cache or database
+        user = await Database.get_or_create_user(wa_id, customer_phone)
+        user_id = user.get("id")
+        
+        # Generate unique order number
+        order_number = f"ORD-{datetime.now():%Y%m%d}-{secrets.token_hex(4).upper()}"
+        
         order_data = {
             "user_id": user_id,
             "wa_id": wa_id,
             "customer_phone": customer_phone,
+            "order_number": order_number,
             "item_id": item_id,
             "item_name": item_name,
             "item_price": item_price,
             "status": "placed",
+            "order_source": "bot_menu",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         result = db.table("orders").insert(order_data).execute()
@@ -316,7 +373,7 @@ class Database:
         
         db = get_supabase()
         result = db.table("orders")\
-            .select("order_number, item_name, status, created_at")\
+            .select("order_number, item_name, items, total_amount, status, created_at")\
             .eq("wa_id", wa_id)\
             .order("created_at", desc=True)\
             .limit(limit)\
@@ -370,7 +427,7 @@ class Database:
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
         except Exception as e:
-            logger.error(f"Failed to log message: {e}")
+            logger.error(f"Failed to log message: {type(e).__name__}")
 
 
 # ============================================================
@@ -380,6 +437,7 @@ class RateLimiter:
     """Optimized rate limiter using in-memory cache + Supabase backup."""
     
     _rate_limits: Dict[str, tuple[int, float]] = {}  # {wa_id: (count, window_start_timestamp)}
+    _last_cleanup = datetime.now()
     
     @staticmethod
     async def check_rate_limit(wa_id: str) -> tuple[bool, int]:
@@ -387,6 +445,9 @@ class RateLimiter:
         Check if user is within rate limit (in-memory first for speed).
         Returns (is_allowed, remaining_requests)
         """
+        # Cleanup old entries periodically
+        await RateLimiter._cleanup_old_entries()
+        
         now = datetime.now(timezone.utc)
         window_start = now.replace(second=0, microsecond=0)
         window_timestamp = window_start.timestamp()
@@ -415,6 +476,19 @@ class RateLimiter:
         asyncio.create_task(RateLimiter._sync_to_db(wa_id, window_start.isoformat(), 1))
         
         return True, config.RATE_LIMIT_REQUESTS - 1
+    
+    @staticmethod
+    async def _cleanup_old_entries():
+        """Remove expired entries every hour."""
+        now = datetime.now()
+        if (now - RateLimiter._last_cleanup).seconds > 3600:
+            current_window = now.replace(second=0, microsecond=0).timestamp()
+            RateLimiter._rate_limits = {
+                k: v for k, v in RateLimiter._rate_limits.items() 
+                if v[1] >= current_window - 3600
+            }
+            RateLimiter._last_cleanup = now
+            logger.info(f"Rate limiter cleanup completed. Active entries: {len(RateLimiter._rate_limits)}")
     
     @staticmethod
     async def _sync_to_db(wa_id: str, window_start: str, count: int):
@@ -534,6 +608,34 @@ class WhatsAppAPI:
         
         return result
     
+    @classmethod
+    async def send_catalogue_message(cls, to: str, body_text: str, catalogue_id: str = None) -> dict:
+        """Send product catalogue message."""
+        # If no catalogue_id provided, use single-product-message (shows all products)
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "catalog_message",
+                "body": {
+                    "text": body_text
+                },
+                "action": {
+                    "name": "catalog_message",
+                }
+            }
+        }
+        
+        result = await cls.send(payload)
+        
+        # Log in background if enabled
+        if config.ENABLE_MESSAGE_LOGGING:
+            asyncio.create_task(Database.log_message(to, "outbound", "catalogue", payload["interactive"]))
+        
+        return result
+    
     @staticmethod
     def verify_signature(payload: bytes, signature: str) -> bool:
         """Verify webhook signature from Meta."""
@@ -561,20 +663,137 @@ class BotFlows:
     
     @staticmethod
     async def show_home(to: str):
-        """Show home menu."""
+        """Show home menu with new structure."""
         await WhatsAppAPI.send_buttons(
             to,
-            "Welcome!!👋 What would you like to do?",
+            "Welcome to CPC! 🛍️\n\nWhat would you like to do?",
             [
-                {"id": BTN_MENU, "title": "📋 Menu"},
-                {"id": BTN_ORDER, "title": "🛒 Order"},
-                {"id": BTN_MORE, "title": "⚙️ More"},
+                {"id": BTN_VIEW_STORE, "title": "🛍️ View Store"},
+                {"id": BTN_HISTORY, "title": "📦 Order History"},
+                {"id": BTN_FAQ, "title": "❓ FAQ"},
             ],
         )
     
     @staticmethod
+    async def show_store(to: str):
+        """Show Meta product catalogue."""
+        await WhatsAppAPI.send_catalogue_message(
+            to,
+            "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and place your order!"
+        )
+        
+        # Show back button after catalogue
+        await asyncio.sleep(1)  # Brief delay
+        await WhatsAppAPI.send_buttons(
+            to,
+            "Need help with anything else?",
+            [
+                {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
+            ],
+        )
+    
+    @staticmethod
+    async def show_history(to: str, wa_id: str):
+        """Show order history."""
+        orders = await Database.get_order_history(wa_id, limit=10)
+        
+        if not orders:
+            await WhatsAppAPI.send_text(
+                to,
+                "📦 *Order History*\n\nYou haven't placed any orders yet.\n\nTap *View Store* to browse our products! 🛍️"
+            )
+            await BotFlows.show_home(to)
+            return
+        
+        lines = ["📦 *Your Recent Orders*\n"]
+        for order in orders:
+            order_num = order.get("order_number", "N/A")
+            status = order.get("status", "unknown")
+            created = order.get("created_at", "")[:10]
+            
+            # Handle both old (item_name) and new (items array) format
+            if order.get("items"):
+                items = order.get("items", [])
+                item_names = ", ".join([item.get("name", "Item") for item in items[:2]])
+                if len(items) > 2:
+                    item_names += f" (+{len(items)-2} more)"
+                total = order.get("total_amount", 0)
+                item_display = f"{item_names} - Rs {total // 100}"
+            else:
+                item_display = order.get("item_name", "Unknown")
+            
+            status_emoji = {
+                "placed": "🆕",
+                "confirmed": "✅",
+                "preparing": "👨‍🍳",
+                "ready": "📦",
+                "delivered": "✔️",
+                "cancelled": "❌",
+            }.get(status, "❓")
+            
+            lines.append(f"{status_emoji} #{order_num}\n   {item_display}\n   {created} • {status.title()}\n")
+        
+        await WhatsAppAPI.send_text(to, "\n".join(lines))
+        await BotFlows.show_home(to)
+    
+    @staticmethod
+    async def show_faq(to: str):
+        """Show FAQ menu."""
+        await WhatsAppAPI.send_buttons(
+            to,
+            "❓ *Frequently Asked Questions*\n\nHow can we help you?",
+            [
+                {"id": BTN_ABOUT_US, "title": "ℹ️ About Us"},
+                {"id": BTN_CONTACT, "title": "📞 Contact"},
+                {"id": BTN_BACK_HOME, "title": "🔙 Back"},
+            ],
+        )
+    
+    @staticmethod
+    async def show_about_us(to: str):
+        """Show about us information."""
+        await WhatsAppAPI.send_text(
+            to,
+            "ℹ️ *About CPC*\n\n"
+            "Welcome to CPC - Your trusted partner for quality products and exceptional service.\n\n"
+            "🏢 *Our Mission*\n"
+            "To provide customers with the best shopping experience through our curated product selection and seamless ordering process.\n\n"
+            "⭐ *Why Choose Us?*\n"
+            "• Quality products\n"
+            "• Fast delivery\n"
+            "• 24/7 customer support\n"
+            "• Secure payment options\n\n"
+            "Thank you for choosing CPC! 🙏"
+        )
+        await BotFlows.show_faq(to)
+    
+    @staticmethod
+    async def show_contact(to: str):
+        """Show contact information."""
+        await WhatsAppAPI.send_text(
+            to,
+            "📞 *Contact Us*\n\n"
+            "We're here to help!\n\n"
+            "📱 WhatsApp: This number\n"
+            "📧 Email: support@cpc.com\n"
+            "🌐 Website: www.cpc.com\n"
+            "⏰ Hours: 9 AM - 9 PM (Mon-Sat)\n\n"
+            "Feel free to reach out anytime!"
+        )
+        await BotFlows.show_faq(to)
+    
+    @staticmethod
+    async def show_rate_limited(to: str):
+        """Show rate limit message."""
+        await WhatsAppAPI.send_text(
+            to,
+            "⏳ You're sending messages too quickly. Please wait a moment and try again."
+        )
+    
+    # Legacy flows (kept for backwards compatibility)
+    @staticmethod
     async def show_menu(to: str):
-        """Show menu with items."""
+        """Show menu with items (legacy)."""
         items = await Database.get_menu_items()
         
         if items:
@@ -585,6 +804,7 @@ class BotFlows:
             lines.append("\nTap *Order* to place an order.")
             menu_text = "\n".join(lines)
         else:
+            logger.warning("No menu items in database, using fallback menu")
             menu_text = (
                 "🧾 *Menu*\n"
                 "• Zinger Burger — Rs 450\n"
@@ -605,7 +825,7 @@ class BotFlows:
     
     @staticmethod
     async def show_order_list(to: str):
-        """Show order selection list."""
+        """Show order selection list (legacy)."""
         items = await Database.get_menu_items()
         
         if items:
@@ -635,7 +855,7 @@ class BotFlows:
     
     @staticmethod
     async def show_more(to: str):
-        """Show more options."""
+        """Show more options (legacy)."""
         await WhatsAppAPI.send_buttons(
             to,
             "More options:",
@@ -644,60 +864,6 @@ class BotFlows:
                 {"id": BTN_CONTACT, "title": "📞 Contact us"},
                 {"id": BTN_BACK_HOME, "title": "🔙 Back"},
             ],
-        )
-    
-    @staticmethod
-    async def show_contact(to: str):
-        """Show contact information."""
-        await WhatsAppAPI.send_text(
-            to,
-            "📞 *Contact Us*\n"
-            "Support: +92-XXX-XXXXXXX\n"
-            "Email: support@yourbrand.com\n"
-            "Hours: 10am–10pm"
-        )
-        await BotFlows.show_home(to)
-    
-    @staticmethod
-    async def show_history(to: str, wa_id: str):
-        """Show order history."""
-        orders = await Database.get_order_history(wa_id, limit=10)
-        
-        if not orders:
-            await WhatsAppAPI.send_text(
-                to,
-                "No orders yet. Tap *Order* to place your first order! 🛒"
-            )
-            await BotFlows.show_home(to)
-            return
-        
-        lines = ["📦 *Your Recent Orders*\n"]
-        for order in orders:
-            order_num = order.get("order_number", "N/A")
-            item_name = order.get("item_name", "Unknown")
-            status = order.get("status", "unknown")
-            created = order.get("created_at", "")[:10]
-            
-            status_emoji = {
-                "placed": "🆕",
-                "confirmed": "✅",
-                "preparing": "👨‍🍳",
-                "ready": "📦",
-                "delivered": "✔️",
-                "cancelled": "❌",
-            }.get(status, "❓")
-            
-            lines.append(f"{status_emoji} #{order_num} {item_name} — {status}")
-        
-        await WhatsAppAPI.send_text(to, "\n".join(lines))
-        await BotFlows.show_home(to)
-    
-    @staticmethod
-    async def show_rate_limited(to: str):
-        """Show rate limit message."""
-        await WhatsAppAPI.send_text(
-            to,
-            "⏳ You're sending messages too quickly. Please wait a moment and try again."
         )
 
 
@@ -711,6 +877,15 @@ def extract_message(data: dict) -> Optional[dict]:
         messages = value.get("messages", [])
         
         if not messages:
+            # Check for order webhook
+            orders = value.get("orders", [])
+            if orders:
+                return {
+                    "kind": "order",
+                    "from": orders[0].get("wa_id"),
+                    "id": f"order_{orders[0].get('catalog_id')}_{datetime.now().timestamp()}",
+                    "order_data": orders[0]
+                }
             return None
         
         msg = messages[0]
@@ -724,6 +899,12 @@ def extract_message(data: dict) -> Optional[dict]:
             "type": msg_type,
         }
         
+        # Handle order messages from catalogue
+        if msg_type == "order":
+            result["kind"] = "order"
+            result["order_data"] = msg.get("order", {})
+            return result
+        
         if msg_type == "interactive":
             interactive = msg.get("interactive", {})
             itype = interactive.get("type")
@@ -736,6 +917,10 @@ def extract_message(data: dict) -> Optional[dict]:
                 result["kind"] = "list"
                 result["reply_id"] = interactive["list_reply"]["id"]
                 result["title"] = interactive["list_reply"]["title"]
+            elif itype == "nfm_reply":
+                # Catalogue/order related
+                result["kind"] = "order"
+                result["order_data"] = interactive.get("nfm_reply", {})
             else:
                 result["kind"] = "interactive_other"
             
@@ -761,14 +946,12 @@ def extract_message(data: dict) -> Optional[dict]:
 async def lifespan(app: FastAPI):
     """App lifespan events."""
     # Startup
-    logger.info("Starting WhatsApp Bot (Performance Optimized)...")
+    logger.info("Starting WhatsApp Bot (Meta Catalogue Edition)...")
     
     missing = config.validate()
     if missing:
         logger.warning(f"⚠️ Missing configuration: {', '.join(missing)}")
         logger.warning("Some features may not work until environment variables are set")
-    else:
-        logger.info("✅ Configuration validated successfully")
     
     # Test Supabase connection
     if is_supabase_configured():
@@ -777,12 +960,12 @@ async def lifespan(app: FastAPI):
             db.table("users").select("id").limit(1).execute()
             logger.info("✅ Supabase connection established")
         except Exception as e:
-            logger.warning(f"⚠️ Supabase connection test failed: {e}")
+            logger.warning(f"⚠️ Supabase connection test failed: {type(e).__name__}")
     else:
         logger.warning("⚠️ Supabase not configured - database features disabled")
     
     logger.info(f"🚀 WhatsApp Bot started in {config.ENVIRONMENT} mode")
-    logger.info(f"⚡ Performance optimizations: Caching enabled, Message logging: {config.ENABLE_MESSAGE_LOGGING}")
+    logger.info(f"⚡ Features: Catalogue integration, Caching enabled, Message logging: {config.ENABLE_MESSAGE_LOGGING}")
     
     yield
     
@@ -793,9 +976,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="WhatsApp Button Bot",
-    description="Production-ready WhatsApp bot with Supabase (Performance Optimized)",
-    version="2.1.0",
+    title="WhatsApp Button Bot with Meta Catalogue",
+    description="Production-ready WhatsApp bot with Meta Catalogue Integration + Supabase",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -815,10 +998,10 @@ app.add_middleware(
 async def root():
     """Root endpoint."""
     return {
-        "name": "WhatsApp Button Bot",
-        "version": "2.1.0",
+        "name": "WhatsApp Button Bot with Meta Catalogue",
+        "version": "2.2.0",
         "status": "running",
-        "optimizations": "enabled"
+        "features": ["meta_catalogue", "order_history", "faq", "caching"]
     }
 
 
@@ -829,7 +1012,7 @@ async def health():
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "environment": config.ENVIRONMENT,
-        "version": "2.1.0",
+        "version": "2.2.0",
         "checks": {}
     }
     
@@ -838,7 +1021,7 @@ async def health():
         db.table("users").select("id").limit(1).execute()
         health_status["checks"]["database"] = "ok"
     except Exception as e:
-        health_status["checks"]["database"] = f"error: {str(e)}"
+        health_status["checks"]["database"] = f"error: {type(e).__name__}"
         health_status["status"] = "degraded"
     
     if config.WHATSAPP_ACCESS_TOKEN and config.WHATSAPP_PHONE_NUMBER_ID:
@@ -868,7 +1051,9 @@ async def verify_webhook(
 
 @app.post("/webhook/whatsapp")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle incoming WhatsApp messages (optimized)."""
+    """Handle incoming WhatsApp messages (optimized with catalogue support)."""
+    start_time = datetime.now()
+    
     body = await request.body()
     
     # Verify signature (if configured)
@@ -919,25 +1104,57 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         background_tasks.add_task(Database.log_message, wa_id, "inbound", msg.get("kind", "unknown"), msg)
     
     try:
+        # Handle catalogue orders
+        if msg["kind"] == "order":
+            order_data = msg.get("order_data", {})
+            
+            # Create order in database
+            order = await Database.create_order_from_catalogue(
+                wa_id=wa_id,
+                customer_phone=to,
+                order_data=order_data
+            )
+            
+            # Send confirmation
+            order_number = order.get("order_number", "N/A")
+            total_amount = order.get("total_amount", 0)
+            
+            await WhatsAppAPI.send_text(
+                to,
+                f"✅ *Order Confirmed!*\n\n"
+                f"Order #{order_number}\n"
+                f"Total: Rs {total_amount // 100}\n\n"
+                f"We've received your order and will start preparing it shortly. "
+                f"You'll receive updates on your order status.\n\n"
+                f"Thank you for shopping with CPC! 🙏"
+            )
+            await BotFlows.show_home(to)
+            
+            processing_time = (datetime.now() - start_time).total_seconds()
+            logger.info(f"Order webhook processed in {processing_time:.3f}s")
+            return JSONResponse({"status": "ok"}, status_code=200)
+        
         # Handle text messages
         if msg["kind"] == "text":
             text = (msg.get("text") or "").strip().lower()
             
-            if text in ("hi", "hello", "start", "hey", "hola"):
+            if text in ("hi", "hello", "start", "hey", "hola", "menu", "home"):
                 await BotFlows.show_home(to)
-            elif text == "menu":
-                await BotFlows.show_menu(to)
-            elif text == "order":
-                await BotFlows.show_order_list(to)
-            elif text == "more":
-                await BotFlows.show_more(to)
-            elif text in ("history", "orders"):
+            elif text in ("store", "shop", "catalogue", "catalog"):
+                await BotFlows.show_store(to)
+            elif text in ("history", "orders", "my orders"):
                 await BotFlows.show_history(to, wa_id)
-            elif text in ("contact", "help", "support"):
+            elif text in ("faq", "help", "info"):
+                await BotFlows.show_faq(to)
+            elif text in ("about", "about us"):
+                await BotFlows.show_about_us(to)
+            elif text in ("contact", "support"):
                 await BotFlows.show_contact(to)
             else:
                 await BotFlows.show_home(to)
             
+            processing_time = (datetime.now() - start_time).total_seconds()
+            logger.info(f"Text webhook processed in {processing_time:.3f}s")
             return JSONResponse({"status": "ok"}, status_code=200)
         
         # Handle button clicks
@@ -945,12 +1162,16 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             rid = msg["reply_id"]
             
             handlers = {
+                BTN_VIEW_STORE: lambda: BotFlows.show_store(to),
+                BTN_HISTORY: lambda: BotFlows.show_history(to, wa_id),
+                BTN_FAQ: lambda: BotFlows.show_faq(to),
+                BTN_ABOUT_US: lambda: BotFlows.show_about_us(to),
+                BTN_CONTACT: lambda: BotFlows.show_contact(to),
+                BTN_BACK_HOME: lambda: BotFlows.show_home(to),
+                # Legacy buttons
                 BTN_MENU: lambda: BotFlows.show_menu(to),
                 BTN_ORDER: lambda: BotFlows.show_order_list(to),
                 BTN_MORE: lambda: BotFlows.show_more(to),
-                BTN_HISTORY: lambda: BotFlows.show_history(to, wa_id),
-                BTN_CONTACT: lambda: BotFlows.show_contact(to),
-                BTN_BACK_HOME: lambda: BotFlows.show_home(to),
             }
             
             handler = handlers.get(rid)
@@ -959,9 +1180,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             else:
                 await BotFlows.show_home(to)
             
+            processing_time = (datetime.now() - start_time).total_seconds()
+            logger.info(f"Button webhook processed in {processing_time:.3f}s")
             return JSONResponse({"status": "ok"}, status_code=200)
         
-        # Handle list selection (ordering)
+        # Handle list selection (legacy ordering)
         if msg["kind"] == "list":
             rid = msg["reply_id"]
             title = msg.get("title", "Item")
@@ -971,6 +1194,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             item_map = {item["item_id"]: item for item in items}
             
             if not item_map:
+                logger.warning("No menu items in database, using fallback items")
                 item_map = {
                     ITEM_ZINGER: {"name": "Zinger Burger", "price": 45000, "item_id": ITEM_ZINGER},
                     ITEM_PIZZA: {"name": "Pizza Slice", "price": 35000, "item_id": ITEM_PIZZA},
@@ -1000,6 +1224,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 await WhatsAppAPI.send_text(to, "❓ I didn't recognize that item. Please try again.")
                 await BotFlows.show_order_list(to)
             
+            processing_time = (datetime.now() - start_time).total_seconds()
+            logger.info(f"List webhook processed in {processing_time:.3f}s")
             return JSONResponse({"status": "ok"}, status_code=200)
         
         # Handle other message types
@@ -1009,12 +1235,18 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             "Please use the menu options below! 👇"
         )
         await BotFlows.show_home(to)
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Other webhook processed in {processing_time:.3f}s")
         return JSONResponse({"status": "ok"}, status_code=200)
     
     except Exception as e:
         logger.exception(f"Error handling message from {wa_id}: {e}")
         if config.ENABLE_MESSAGE_LOGGING:
             background_tasks.add_task(Database.log_message, wa_id, "inbound", msg.get("kind"), msg, status="error", error=str(e))
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.error(f"Error webhook processed in {processing_time:.3f}s")
         return JSONResponse({"status": "error"}, status_code=200)
 
 
@@ -1036,17 +1268,25 @@ async def get_stats():
             .gte("created_at", today_start.isoformat())\
             .execute()
         
+        # Get catalogue vs bot menu orders
+        catalogue_orders = db.table("orders")\
+            .select("id", count="exact")\
+            .eq("order_source", "meta_catalogue")\
+            .execute()
+        
         return {
             "total_users": users_result.count or 0,
             "total_orders": orders_result.count or 0,
             "orders_today": orders_today.count or 0,
+            "catalogue_orders": catalogue_orders.count or 0,
+            "bot_menu_orders": (orders_result.count or 0) - (catalogue_orders.count or 0),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "cache_enabled": True,
             "message_logging": config.ENABLE_MESSAGE_LOGGING,
         }
     except Exception as e:
-        logger.error(f"Error getting stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting stats: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="Failed to fetch statistics")
 
 
 @app.post("/admin/cache/clear")
