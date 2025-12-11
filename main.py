@@ -711,49 +711,37 @@ class WhatsAppAPI:
         return result
     
     @classmethod
-    async def get_product_details(cls, catalog_id: str, product_retailer_id: str) -> dict:
-        """Fetch product details from Meta Catalogue API."""
-        if not config.WHATSAPP_ACCESS_TOKEN:
-            logger.error("Cannot fetch product details: WHATSAPP_ACCESS_TOKEN not set")
-            return {"name": "Unknown Item", "price": 0}
-        
+    async def send_catalogue_message(cls, to: str, body_text: str, catalogue_id: str = None) -> dict:
+        """Send product catalogue message."""
         try:
-            headers = {
-                "Authorization": f"Bearer {config.WHATSAPP_ACCESS_TOKEN}",
-            }
-            
-            # Try to get product from catalog
-            url = f"{cls.BASE_URL}/{catalog_id}/products"
-            params = {
-                "fields": "name,retailer_id,price,currency,image_url",
-                "filter": json.dumps({"retailer_id": product_retailer_id})
-            }
-            
-            client = get_http_client()
-            response = await client.get(url, headers=headers, params=params)
-            
-            if response.status_code == 200:
-                data = response.json()
-                products = data.get("data", [])
-                if products:
-                    product = products[0]
-                    logger.info(f"Fetched product: {product.get('name')} - {product.get('price')}")
-                    return {
-                        "name": product.get("name", "Unknown Item"),
-                        "price": product.get("price", 0),
-                        "currency": product.get("currency", "PKR"),
-                        "image_url": product.get("image_url")
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": to,
+                "type": "interactive",
+                "interactive": {
+                    "type": "catalog_message",
+                    "body": {
+                        "text": body_text
+                    },
+                    "action": {
+                        "name": "catalog_message",
                     }
+                }
+            }
             
-            logger.warning(f"Could not fetch product details for {product_retailer_id}")
-            return {"name": "Unknown Item", "price": 0}
+            result = await cls.send(payload)
             
+            if config.ENABLE_MESSAGE_LOGGING:
+                asyncio.create_task(Database.log_message(to, "outbound", "catalogue", payload["interactive"]))
+            
+            return result
         except Exception as e:
-            logger.error(f"Error fetching product details: {type(e).__name__} - {str(e)}")
-            return {"name": "Unknown Item", "price": 0}
+            logger.error(f"Failed to send catalogue message: {type(e).__name__} - {str(e)}")
+            raise
     
     @classmethod
-    async def send_catalogue_message(cls, to: str, body_text: str, catalogue_id: str = None) -> dict:
+    async def get_product_details(cls, catalog_id: str, product_retailer_id: str) -> dict:
         """Fetch product details from Meta Catalogue API."""
         if not config.WHATSAPP_ACCESS_TOKEN:
             logger.error("Cannot fetch product details: WHATSAPP_ACCESS_TOKEN not set")
@@ -993,19 +981,33 @@ class BotFlows:
     @staticmethod
     async def show_store(to: str):
         """Show Meta product catalogue."""
-        await WhatsAppAPI.send_catalogue_message(
-            to,
-            "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and place your order!"
-        )
-        
-        await asyncio.sleep(1)
-        await WhatsAppAPI.send_buttons(
-            to,
-            "Need help with anything else?",
-            [
-                {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
-            ],
-        )
+        try:
+            await WhatsAppAPI.send_catalogue_message(
+                to,
+                "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and place your order!"
+            )
+            
+            await asyncio.sleep(1)
+            await WhatsAppAPI.send_buttons(
+                to,
+                "Need help with anything else?",
+                [
+                    {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
+                ],
+            )
+        except Exception as e:
+            logger.error(f"Error showing store: {type(e).__name__} - {str(e)}")
+            # Fallback: inform user
+            await WhatsAppAPI.send_text(
+                to,
+                "🛍️ *Our Store*\n\n"
+                "To view our products:\n"
+                "1. Tap the 📎 attachment icon\n"
+                "2. Select 'Product Catalogue'\n"
+                "3. Browse and order!\n\n"
+                "Or visit our website: www.cpc.com"
+            )
+            await BotFlows.show_home(to)
     
     @staticmethod
     async def show_checkout(to: str, wa_id: str):
