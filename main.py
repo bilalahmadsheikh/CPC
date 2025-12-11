@@ -303,8 +303,10 @@ class Database:
         # Log the incoming order data for debugging
         logger.info(f"Received order_data: {json.dumps(order_data, indent=2)}")
         
+        # Extract catalog ID
+        catalog_id = order_data.get("catalog_id") or order_data.get("catalogue_id")
+        
         # Extract and calculate order details properly
-        # Try different possible structures from Meta webhook
         items = order_data.get("product_items", [])
         if not items:
             items = order_data.get("items", [])
@@ -314,39 +316,40 @@ class Database:
         processed_items = []
         
         for item in items:
-            # Extract item details - Meta uses different field names
-            # Try multiple possible field names
-            item_name = (
-                item.get("name") or 
-                item.get("product_name") or 
-                item.get("title") or 
-                "Unknown Item"
-            )
+            # Get product retailer ID
+            product_retailer_id = item.get("product_retailer_id", "")
             
-            # Price might be in different fields and formats
-            item_price = (
-                item.get("item_price") or 
-                item.get("price") or 
-                item.get("unit_price") or 
-                0
-            )
-            
-            # Convert price to integer paisa if it's a float or string
-            if isinstance(item_price, (float, str)):
-                try:
-                    # If price is in rupees (e.g., 450.00), convert to paisa
-                    item_price = int(float(item_price) * 100)
-                except:
-                    item_price = 0
+            # Meta doesn't send product names in webhook!
+            # We need to fetch it from their API
+            if catalog_id and product_retailer_id:
+                product_details = await WhatsAppAPI.get_product_details(catalog_id, product_retailer_id)
+                item_name = product_details.get("name", "Unknown Item")
+                # Use API price if webhook price seems wrong (like 5000 paisa = Rs 50)
+                api_price = product_details.get("price", "0")
+                if api_price:
+                    try:
+                        # Convert API price string to paisa
+                        item_price = int(float(api_price) * 100)
+                    except:
+                        item_price = int(item.get("item_price", 0))
+                else:
+                    item_price = int(item.get("item_price", 0))
             else:
-                item_price = int(item_price)
+                # Fallback: Try to extract from webhook (though it usually doesn't have name)
+                item_name = (
+                    item.get("name") or 
+                    item.get("product_name") or 
+                    item.get("title") or 
+                    "Unknown Item"
+                )
+                item_price = int(item.get("item_price", 0))
             
             quantity = int(item.get("quantity", 1))
             item_total = item_price * quantity
             subtotal += item_total
             
             processed_items.append({
-                "product_retailer_id": item.get("product_retailer_id", ""),
+                "product_retailer_id": product_retailer_id,
                 "name": item_name,
                 "quantity": quantity,
                 "item_price": item_price,
@@ -378,7 +381,7 @@ class Database:
             "quantity": len(items) if items else 1,
             "status": "pending_payment",
             "order_source": "meta_catalogue",
-            "meta_order_id": order_data.get("order_id") or order_data.get("catalog_id"),
+            "meta_order_id": order_data.get("order_id") or catalog_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         
@@ -708,7 +711,88 @@ class WhatsAppAPI:
         return result
     
     @classmethod
+    async def get_product_details(cls, catalog_id: str, product_retailer_id: str) -> dict:
+        """Fetch product details from Meta Catalogue API."""
+        if not config.WHATSAPP_ACCESS_TOKEN:
+            logger.error("Cannot fetch product details: WHATSAPP_ACCESS_TOKEN not set")
+            return {"name": "Unknown Item", "price": 0}
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {config.WHATSAPP_ACCESS_TOKEN}",
+            }
+            
+            # Try to get product from catalog
+            url = f"{cls.BASE_URL}/{catalog_id}/products"
+            params = {
+                "fields": "name,retailer_id,price,currency,image_url",
+                "filter": json.dumps({"retailer_id": product_retailer_id})
+            }
+            
+            client = get_http_client()
+            response = await client.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                products = data.get("data", [])
+                if products:
+                    product = products[0]
+                    logger.info(f"Fetched product: {product.get('name')} - {product.get('price')}")
+                    return {
+                        "name": product.get("name", "Unknown Item"),
+                        "price": product.get("price", 0),
+                        "currency": product.get("currency", "PKR"),
+                        "image_url": product.get("image_url")
+                    }
+            
+            logger.warning(f"Could not fetch product details for {product_retailer_id}")
+            return {"name": "Unknown Item", "price": 0}
+            
+        except Exception as e:
+            logger.error(f"Error fetching product details: {type(e).__name__} - {str(e)}")
+            return {"name": "Unknown Item", "price": 0}
+    
+    @classmethod
     async def send_catalogue_message(cls, to: str, body_text: str, catalogue_id: str = None) -> dict:
+        """Fetch product details from Meta Catalogue API."""
+        if not config.WHATSAPP_ACCESS_TOKEN:
+            logger.error("Cannot fetch product details: WHATSAPP_ACCESS_TOKEN not set")
+            return {"name": "Unknown Item", "price": 0}
+        
+        try:
+            headers = {
+                "Authorization": f"Bearer {config.WHATSAPP_ACCESS_TOKEN}",
+            }
+            
+            # Try to get product from catalog
+            url = f"{cls.BASE_URL}/{catalog_id}/products"
+            params = {
+                "fields": "name,retailer_id,price,currency,image_url",
+                "filter": json.dumps({"retailer_id": product_retailer_id})
+            }
+            
+            client = get_http_client()
+            response = await client.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                products = data.get("data", [])
+                if products:
+                    product = products[0]
+                    logger.info(f"Fetched product: {product.get('name')} - {product.get('price')}")
+                    return {
+                        "name": product.get("name", "Unknown Item"),
+                        "price": product.get("price", 0),
+                        "currency": product.get("currency", "PKR"),
+                        "image_url": product.get("image_url")
+                    }
+            
+            logger.warning(f"Could not fetch product details for {product_retailer_id}")
+            return {"name": "Unknown Item", "price": 0}
+            
+        except Exception as e:
+            logger.error(f"Error fetching product details: {type(e).__name__} - {str(e)}")
+            return {"name": "Unknown Item", "price": 0}
         """Send product catalogue message."""
         payload = {
             "messaging_product": "whatsapp",
