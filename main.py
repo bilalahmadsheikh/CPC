@@ -50,11 +50,10 @@ class Config:
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
     
-    # Bank Details for Bank Transfer
-    BANK_NAME: str = os.getenv("BANK_NAME", "HBL Bank")
-    BANK_ACCOUNT_NUMBER: str = os.getenv("BANK_ACCOUNT_NUMBER", "1234567890123456")
-    BANK_ACCOUNT_TITLE: str = os.getenv("BANK_ACCOUNT_TITLE", "CPC Store")
-    BANK_IBAN: str = os.getenv("BANK_IBAN", "PK12HABB0000001234567890")
+    # Payment Details for Bank Transfer
+    PAYMENT_METHOD: str = os.getenv("PAYMENT_METHOD", "SadaPay")
+    PAYMENT_NUMBER: str = os.getenv("PAYMENT_NUMBER", "03216320882")
+    PAYMENT_ACCOUNT_TITLE: str = os.getenv("PAYMENT_ACCOUNT_TITLE", "DARA BODLA")
     
     # Performance Settings
     CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "300"))
@@ -727,40 +726,46 @@ class BillingHelper:
     def format_currency(amount_paisa: int) -> str:
         """Format amount in paisa to rupees string."""
         rupees = amount_paisa / 100
-        return f"Rs {rupees:,.2f}"
+        return f"Rs {rupees:,.0f}"
     
     @staticmethod
     def generate_bill(order: dict) -> str:
-        """Generate a formatted bill for an order."""
+        """Generate a professional formatted bill for an order."""
         order_number = order.get("order_number", "N/A")
         items = order.get("items", [])
         subtotal = order.get("subtotal", 0)
         tax_amount = order.get("tax_amount", 0)
         total_amount = order.get("total_amount", 0)
         
+        # Get current date and time
+        current_time = datetime.now().strftime('%d %b %Y, %I:%M %p')
+        
         bill_lines = [
-            "╔════════════════════════════════╗",
-            "║        📋 ORDER BILL           ║",
-            "╚════════════════════════════════╝",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "            🛍️ *CPC STORE*            ",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             "",
-            f"Order #: {order_number}",
-            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "─" * 34,
+            f"📋 *Order Number:* #{order_number}",
+            f"📅 *Date:* {current_time}",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "*ORDER DETAILS*",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             ""
         ]
         
         # Handle both catalogue orders and legacy orders
         if items and isinstance(items, list) and len(items) > 0:
             # Catalogue order with multiple items
-            bill_lines.append("Items:")
-            for item in items:
+            for idx, item in enumerate(items, 1):
                 name = item.get("name", "Unknown Item")
                 qty = item.get("quantity", 1)
                 price = item.get("item_price", 0)
                 item_total = item.get("item_total", price * qty)
                 
-                bill_lines.append(f"  • {name}")
-                bill_lines.append(f"    {qty} x {BillingHelper.format_currency(price)} = {BillingHelper.format_currency(item_total)}")
+                bill_lines.append(f"*{idx}. {name}*")
+                bill_lines.append(f"   Qty: {qty} × {BillingHelper.format_currency(price)} = {BillingHelper.format_currency(item_total)}")
+                bill_lines.append("")
         else:
             # Legacy order with single item
             item_name = order.get("item_name", "Unknown Item")
@@ -768,25 +773,34 @@ class BillingHelper:
             item_price = order.get("item_price", 0)
             item_total = item_price * quantity
             
-            bill_lines.append("Items:")
-            bill_lines.append(f"  • {item_name}")
-            bill_lines.append(f"    {quantity} x {BillingHelper.format_currency(item_price)} = {BillingHelper.format_currency(item_total)}")
+            bill_lines.append(f"*1. {item_name}*")
+            bill_lines.append(f"   Qty: {quantity} × {BillingHelper.format_currency(item_price)} = {BillingHelper.format_currency(item_total)}")
+            bill_lines.append("")
         
         bill_lines.extend([
-            "",
-            "─" * 34,
-            f"Subtotal:        {BillingHelper.format_currency(subtotal)}",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "*PAYMENT SUMMARY*",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            ""
         ])
         
+        # Calculate total items
+        total_items = len(items) if items else 1
+        bill_lines.append(f"Items ({total_items}):                {BillingHelper.format_currency(subtotal)}")
+        
         if tax_amount > 0:
-            bill_lines.append(f"Tax:             {BillingHelper.format_currency(tax_amount)}")
+            bill_lines.append(f"Tax:                      {BillingHelper.format_currency(tax_amount)}")
         
         bill_lines.extend([
-            "─" * 34,
-            f"*Total:          {BillingHelper.format_currency(total_amount)}*",
-            "─" * 34,
+            "                                    ",
+            f"*TOTAL:              {BillingHelper.format_currency(total_amount)}*",
             "",
-            "Thank you for shopping with CPC! 🛍️"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "",
+            "✅ *Ready to checkout!*",
+            "Tap the button below to proceed with payment.",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         ])
         
         return "\n".join(bill_lines)
@@ -796,26 +810,33 @@ class BillingHelper:
         """Generate payment receipt after successful payment."""
         order_number = order.get("order_number", "N/A")
         total_amount = order.get("total_amount", 0)
+        current_time = datetime.now().strftime('%d %b %Y, %I:%M %p')
         
         receipt_lines = [
-            "╔════════════════════════════════╗",
-            "║      ✅ PAYMENT CONFIRMED      ║",
-            "╚════════════════════════════════╝",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "        ✅ *PAYMENT CONFIRMED*        ",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             "",
-            f"Order #: {order_number}",
-            f"Amount Paid: {BillingHelper.format_currency(total_amount)}",
-            f"Payment Method: {payment_method}",
-            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"📋 *Order #:* {order_number}",
+            f"💰 *Amount Paid:* {BillingHelper.format_currency(total_amount)}",
+            f"💳 *Payment Method:* {payment_method}",
+            f"📅 *Date:* {current_time}",
             "",
-            "─" * 34,
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
             "",
-            "Your order has been confirmed! 🎉",
-            "We'll start preparing it right away.",
+            "🎉 *Thank you for your order!*",
             "",
-            "Track your order status by visiting",
-            "📦 Order History",
+            "Your order has been confirmed and",
+            "we'll start preparing it right away.",
             "",
-            "Thank you for your business! 🙏"
+            "You'll receive updates on your order status.",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "",
+            "Track your order anytime by tapping",
+            "*📦 Order History* from the main menu.",
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         ]
         
         return "\n".join(receipt_lines)
@@ -845,15 +866,14 @@ class BotFlows:
         """Show Meta product catalogue."""
         await WhatsAppAPI.send_catalogue_message(
             to,
-            "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and add to cart!"
+            "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and place your order!"
         )
         
         await asyncio.sleep(1)
         await WhatsAppAPI.send_buttons(
             to,
-            "After adding items to cart, proceed to checkout:",
+            "Need help with anything else?",
             [
-                {"id": BTN_CHECKOUT, "title": "🛒 Checkout"},
                 {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
             ],
         )
@@ -890,7 +910,7 @@ class BotFlows:
     
     @staticmethod
     async def show_bank_transfer_details(to: str, wa_id: str):
-        """Show bank transfer details and instructions."""
+        """Show SadaPay transfer details and instructions."""
         order = await Database.get_pending_order(wa_id)
         
         if not order:
@@ -901,28 +921,33 @@ class BotFlows:
         total_amount = order.get("total_amount", 0)
         order_number = order.get("order_number", "N/A")
         
-        bank_details = (
-            "🏦 *Bank Transfer Details*\n"
-            "─" * 34 + "\n\n"
-            f"*Bank Name:* {config.BANK_NAME}\n"
-            f"*Account Title:* {config.BANK_ACCOUNT_TITLE}\n"
-            f"*Account Number:* {config.BANK_ACCOUNT_NUMBER}\n"
-            f"*IBAN:* {config.BANK_IBAN}\n\n"
-            f"*Amount to Transfer:* {BillingHelper.format_currency(total_amount)}\n"
+        payment_details = (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "        💳 *PAYMENT DETAILS*        \n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"*Payment Method:* {config.PAYMENT_METHOD}\n"
+            f"*Account Number:* `{config.PAYMENT_NUMBER}`\n"
+            f"*Account Title:* {config.PAYMENT_ACCOUNT_TITLE}\n\n"
+            f"*Amount to Transfer:* *{BillingHelper.format_currency(total_amount)}*\n"
             f"*Order Reference:* #{order_number}\n\n"
-            "─" * 34 + "\n\n"
-            "📝 *Instructions:*\n"
-            "1. Transfer the exact amount to the account above\n"
-            "2. Use Order Reference #{} in the description\n"
-            "3. After transfer, click 'Confirm Payment' below\n"
-            "4. Send us the payment screenshot for verification\n\n"
-            "⚠️ *Important:*\n"
-            "• Include order reference in transfer description\n"
-            "• Keep your transaction receipt\n"
-            "• Payment verification may take 5-10 minutes"
-        ).format(order_number)
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📝 *HOW TO PAY:*\n\n"
+            "1️⃣ Open your mobile banking app\n"
+            f"2️⃣ Send *{BillingHelper.format_currency(total_amount)}* to: `{config.PAYMENT_NUMBER}`\n"
+            f"3️⃣ Add \"Order #{order_number}\" in the description\n"
+            "4️⃣ Take a screenshot of the payment receipt\n"
+            "5️⃣ Click *'Confirm Payment'* below\n"
+            "6️⃣ Send us the screenshot for verification\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "⚠️ *IMPORTANT:*\n"
+            "• Transfer the *exact amount*\n"
+            f"• Mention Order #{order_number} in description\n"
+            "• Keep your payment receipt\n"
+            "• Payment verification: 5-10 minutes\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
         
-        await WhatsAppAPI.send_text(to, bank_details)
+        await WhatsAppAPI.send_text(to, payment_details)
         
         # Update order with payment method
         await Database.update_order_payment(order["id"], "bank_transfer", "pending")
@@ -973,7 +998,7 @@ class BotFlows:
         await Database.update_order_payment(order["id"], order.get("payment_method", "bank_transfer"), "confirmed")
         
         # Generate receipt
-        receipt = BillingHelper.generate_payment_receipt(order, "Bank Transfer")
+        receipt = BillingHelper.generate_payment_receipt(order, f"{config.PAYMENT_METHOD} Transfer")
         await WhatsAppAPI.send_text(to, receipt)
         
         await BotFlows.show_home(to)
@@ -1394,17 +1419,19 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 order_data=order_data
             )
             
-            # Send bill and ask for checkout
+            # Send professional bill
             bill = BillingHelper.generate_bill(order)
             await WhatsAppAPI.send_text(to, bill)
             
+            # Proceed to checkout with payment options
             await asyncio.sleep(1)
             await WhatsAppAPI.send_buttons(
                 to,
-                "Your cart is ready! Proceed to checkout to complete your order:",
+                "💳 *Choose Payment Method*\n\nHow would you like to pay?",
                 [
-                    {"id": BTN_CHECKOUT, "title": "🛒 Checkout"},
-                    {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
+                    {"id": BTN_PAY_BANK, "title": "📱 Mobile Transfer"},
+                    {"id": BTN_PAY_CARD, "title": "💳 Card Payment"},
+                    {"id": BTN_BACK_HOME, "title": "🔙 Cancel"},
                 ],
             )
             
