@@ -300,32 +300,68 @@ class Database:
         user = await Database.get_or_create_user(wa_id, customer_phone)
         user_id = user.get("id")
         
+        # Log the incoming order data for debugging
+        logger.info(f"Received order_data: {json.dumps(order_data, indent=2)}")
+        
         # Extract and calculate order details properly
+        # Try different possible structures from Meta webhook
         items = order_data.get("product_items", [])
+        if not items:
+            items = order_data.get("items", [])
         
         # Calculate totals correctly
         subtotal = 0
         processed_items = []
         
         for item in items:
-            item_price = int(item.get("item_price", 0))  # Price in paisa
+            # Extract item details - Meta uses different field names
+            # Try multiple possible field names
+            item_name = (
+                item.get("name") or 
+                item.get("product_name") or 
+                item.get("title") or 
+                "Unknown Item"
+            )
+            
+            # Price might be in different fields and formats
+            item_price = (
+                item.get("item_price") or 
+                item.get("price") or 
+                item.get("unit_price") or 
+                0
+            )
+            
+            # Convert price to integer paisa if it's a float or string
+            if isinstance(item_price, (float, str)):
+                try:
+                    # If price is in rupees (e.g., 450.00), convert to paisa
+                    item_price = int(float(item_price) * 100)
+                except:
+                    item_price = 0
+            else:
+                item_price = int(item_price)
+            
             quantity = int(item.get("quantity", 1))
             item_total = item_price * quantity
             subtotal += item_total
             
             processed_items.append({
-                "product_retailer_id": item.get("product_retailer_id"),
-                "name": item.get("name", "Unknown Item"),
+                "product_retailer_id": item.get("product_retailer_id", ""),
+                "name": item_name,
                 "quantity": quantity,
                 "item_price": item_price,
-                "currency": item.get("currency", "INR"),
+                "currency": item.get("currency", "PKR"),
                 "item_total": item_total
             })
+            
+            logger.info(f"Processed item: {item_name}, price: {item_price}, qty: {quantity}, total: {item_total}")
         
         # Calculate tax and total (if applicable)
         tax_rate = 0.0  # Adjust if you have tax
         tax_amount = int(subtotal * tax_rate)
         total_amount = subtotal + tax_amount
+        
+        logger.info(f"Order totals - Subtotal: {subtotal}, Tax: {tax_amount}, Total: {total_amount}")
         
         item_display = f"{len(items)} item(s) from catalogue" if items else "Catalogue order"
         
@@ -342,7 +378,7 @@ class Database:
             "quantity": len(items) if items else 1,
             "status": "pending_payment",
             "order_source": "meta_catalogue",
-            "meta_order_id": order_data.get("order_id"),
+            "meta_order_id": order_data.get("order_id") or order_data.get("catalog_id"),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         
@@ -737,8 +773,12 @@ class BillingHelper:
         tax_amount = order.get("tax_amount", 0)
         total_amount = order.get("total_amount", 0)
         
-        # Get current date and time
-        current_time = datetime.now().strftime('%d %b %Y, %I:%M %p')
+        # Get current date and time in Pakistan timezone (UTC+5)
+        # WhatsApp bot runs on UTC, so add 5 hours for PKT
+        utc_now = datetime.now(timezone.utc)
+        pkt_offset = timedelta(hours=5)
+        pkt_time = utc_now + pkt_offset
+        current_time = pkt_time.strftime('%d %b %Y, %I:%M %p')
         
         bill_lines = [
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -810,7 +850,12 @@ class BillingHelper:
         """Generate payment receipt after successful payment."""
         order_number = order.get("order_number", "N/A")
         total_amount = order.get("total_amount", 0)
-        current_time = datetime.now().strftime('%d %b %Y, %I:%M %p')
+        
+        # Get current date and time in Pakistan timezone (UTC+5)
+        utc_now = datetime.now(timezone.utc)
+        pkt_offset = timedelta(hours=5)
+        pkt_time = utc_now + pkt_offset
+        current_time = pkt_time.strftime('%d %b %Y, %I:%M %p')
         
         receipt_lines = [
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -1412,6 +1457,11 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         # Handle catalogue orders
         if msg["kind"] == "order":
             order_data = msg.get("order_data", {})
+            
+            # Log the full order data for debugging
+            logger.info(f"=== META CATALOGUE ORDER RECEIVED ===")
+            logger.info(f"From: {wa_id}")
+            logger.info(f"Order data structure: {json.dumps(order_data, indent=2)}")
             
             order = await Database.create_order_from_catalogue(
                 wa_id=wa_id,
