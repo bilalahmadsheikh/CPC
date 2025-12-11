@@ -1,7 +1,7 @@
 """
-WhatsApp Button Bot - Performance Optimized
+WhatsApp Button Bot - Performance Optimized with Billing & Payment
 FastAPI + Supabase + Railway Deployment + Meta Catalogue Integration
-v2.2.0 - Meta Catalogue Edition
+v2.3.0 - Enhanced Billing & Payment Edition
 """
 
 import os
@@ -44,14 +44,20 @@ class Config:
     WHATSAPP_PHONE_NUMBER_ID: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
     WHATSAPP_VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "cpc")
     WHATSAPP_APP_SECRET: str = os.getenv("WHATSAPP_APP_SECRET", "")
-    WHATSAPP_BUSINESS_ID: str = os.getenv("WHATSAPP_BUSINESS_ID", "")  # NEW: For catalogue
+    WHATSAPP_BUSINESS_ID: str = os.getenv("WHATSAPP_BUSINESS_ID", "")
     
     # Supabase
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
     SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
     
+    # Bank Details for Bank Transfer
+    BANK_NAME: str = os.getenv("BANK_NAME", "HBL Bank")
+    BANK_ACCOUNT_NUMBER: str = os.getenv("BANK_ACCOUNT_NUMBER", "1234567890123456")
+    BANK_ACCOUNT_TITLE: str = os.getenv("BANK_ACCOUNT_TITLE", "CPC Store")
+    BANK_IBAN: str = os.getenv("BANK_IBAN", "PK12HABB0000001234567890")
+    
     # Performance Settings
-    CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 minutes
+    CACHE_TTL_SECONDS: int = int(os.getenv("CACHE_TTL_SECONDS", "300"))
     RATE_LIMIT_REQUESTS: int = int(os.getenv("RATE_LIMIT_REQUESTS", "30"))
     RATE_LIMIT_WINDOW_SECONDS: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
     ENABLE_MESSAGE_LOGGING: bool = os.getenv("ENABLE_MESSAGE_LOGGING", "false").lower() == "true"
@@ -73,7 +79,6 @@ class Config:
         if not cls.SUPABASE_SERVICE_KEY:
             missing.append("SUPABASE_SERVICE_KEY")
         
-        # Log validation result without exposing values
         if not missing:
             logger.info("✅ All credentials validated (values masked)")
         
@@ -165,8 +170,12 @@ BTN_HISTORY = "BTN_HISTORY"
 BTN_FAQ = "BTN_FAQ"
 BTN_ABOUT_US = "BTN_ABOUT_US"
 BTN_BACK_HOME = "BTN_BACK_HOME"
+BTN_CHECKOUT = "BTN_CHECKOUT"
+BTN_PAY_BANK = "BTN_PAY_BANK"
+BTN_PAY_CARD = "BTN_PAY_CARD"
+BTN_CONFIRM_PAYMENT = "BTN_CONFIRM_PAYMENT"
 
-# Legacy buttons (keeping for backwards compatibility)
+# Legacy buttons
 BTN_MENU = "BTN_MENU"
 BTN_ORDER = "BTN_ORDER"
 BTN_MORE = "BTN_MORE"
@@ -190,23 +199,19 @@ class Database:
         cached_user = cache.get(cache_key)
         
         if cached_user:
-            # Update last_active in background (non-blocking)
             asyncio.create_task(Database._update_user_activity(wa_id))
             return cached_user
         
         db = get_supabase()
         
-        # Try to get existing user
         result = db.table("users").select("*").eq("wa_id", wa_id).execute()
         
         if result.data:
             user = result.data[0]
-            cache.set(cache_key, user, 600)  # Cache for 10 minutes
-            # Update last_active in background
+            cache.set(cache_key, user, 600)
             asyncio.create_task(Database._update_user_activity(wa_id))
             return user
         
-        # Create new user
         new_user = {
             "wa_id": wa_id,
             "phone": phone or wa_id,
@@ -246,7 +251,7 @@ class Database:
         if result.data:
             is_blocked = result.data[0].get("is_blocked", False)
         
-        cache.set(cache_key, is_blocked, 300)  # Cache for 5 minutes
+        cache.set(cache_key, is_blocked, 300)
         return is_blocked
 
     @staticmethod
@@ -262,7 +267,7 @@ class Database:
         
         is_processed = len(result.data) > 0
         if is_processed:
-            cache.set(cache_key, True, 3600)  # Cache for 1 hour
+            cache.set(cache_key, True, 3600)
         
         return is_processed
 
@@ -272,7 +277,6 @@ class Database:
         cache_key = f"processed:{message_id}"
         cache.set(cache_key, True, 3600)
         
-        # Insert to database in background
         asyncio.create_task(Database._insert_processed_message(message_id, wa_id, message_type))
     
     @staticmethod
@@ -291,32 +295,53 @@ class Database:
 
     @staticmethod
     async def create_order_from_catalogue(wa_id: str, customer_phone: str, order_data: dict) -> dict:
-        """Create order from Meta catalogue purchase."""
+        """Create order from Meta catalogue purchase with proper billing."""
         db = get_supabase()
         
-        # Get user_id from cache or database
         user = await Database.get_or_create_user(wa_id, customer_phone)
         user_id = user.get("id")
         
-        # Extract order details from Meta catalogue webhook
-        items = order_data.get("items", [])
-        total_amount = sum(item.get("item_price", 0) for item in items)
+        # Extract and calculate order details properly
+        items = order_data.get("product_items", [])
         
-        # For catalogue orders with multiple items
-        # Set item_id and item_name to generic values since we store details in items JSONB
+        # Calculate totals correctly
+        subtotal = 0
+        processed_items = []
+        
+        for item in items:
+            item_price = int(item.get("item_price", 0))  # Price in paisa
+            quantity = int(item.get("quantity", 1))
+            item_total = item_price * quantity
+            subtotal += item_total
+            
+            processed_items.append({
+                "product_retailer_id": item.get("product_retailer_id"),
+                "name": item.get("name", "Unknown Item"),
+                "quantity": quantity,
+                "item_price": item_price,
+                "currency": item.get("currency", "INR"),
+                "item_total": item_total
+            })
+        
+        # Calculate tax and total (if applicable)
+        tax_rate = 0.0  # Adjust if you have tax
+        tax_amount = int(subtotal * tax_rate)
+        total_amount = subtotal + tax_amount
+        
         item_display = f"{len(items)} item(s) from catalogue" if items else "Catalogue order"
         
         order_record = {
             "user_id": user_id,
             "wa_id": wa_id,
             "customer_phone": customer_phone,
-            # Don't set order_number - let database auto-generate (SERIAL)
-            "item_id": "CAT_ORDER",  # Generic ID for catalogue orders
-            "item_name": item_display,  # Display name
-            "items": items,  # Store as JSONB
+            "item_id": "CAT_ORDER",
+            "item_name": item_display,
+            "items": processed_items,
+            "subtotal": subtotal,
+            "tax_amount": tax_amount,
             "total_amount": total_amount,
             "quantity": len(items) if items else 1,
-            "status": "placed",
+            "status": "pending_payment",
             "order_source": "meta_catalogue",
             "meta_order_id": order_data.get("order_id"),
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -324,46 +349,98 @@ class Database:
         
         result = db.table("orders").insert(order_record).execute()
         
-        # Get order number from result
         order = result.data[0] if result.data else order_record
         order_number = order.get("order_number", "N/A")
         
         logger.info(f"Catalogue order created: {order_number} for {wa_id}")
         
-        # Invalidate order history cache
         cache.delete(f"order_history:{wa_id}")
+        cache.set(f"pending_order:{wa_id}", order, 1800)  # Cache for 30 minutes
         
         return order
+
+    @staticmethod
+    async def get_pending_order(wa_id: str) -> Optional[dict]:
+        """Get pending order for payment."""
+        cache_key = f"pending_order:{wa_id}"
+        cached_order = cache.get(cache_key)
+        
+        if cached_order:
+            return cached_order
+        
+        db = get_supabase()
+        result = db.table("orders")\
+            .select("*")\
+            .eq("wa_id", wa_id)\
+            .eq("status", "pending_payment")\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if result.data:
+            order = result.data[0]
+            cache.set(cache_key, order, 1800)
+            return order
+        
+        return None
+
+    @staticmethod
+    async def update_order_payment(order_id: str, payment_method: str, payment_status: str = "pending") -> dict:
+        """Update order with payment information."""
+        db = get_supabase()
+        
+        update_data = {
+            "payment_method": payment_method,
+            "payment_status": payment_status,
+            "status": "placed" if payment_status == "confirmed" else "pending_payment",
+            "payment_confirmed_at": datetime.now(timezone.utc).isoformat() if payment_status == "confirmed" else None,
+        }
+        
+        result = db.table("orders").update(update_data).eq("id", order_id).execute()
+        
+        if result.data:
+            order = result.data[0]
+            wa_id = order.get("wa_id")
+            cache.delete(f"pending_order:{wa_id}")
+            cache.delete(f"order_history:{wa_id}")
+            
+        return result.data[0] if result.data else {}
 
     @staticmethod
     async def create_order(wa_id: str, customer_phone: str, item_id: str, item_name: str, item_price: int = None) -> dict:
         """Create a new order (legacy method)."""
         db = get_supabase()
         
-        # Get user_id from cache or database
         user = await Database.get_or_create_user(wa_id, customer_phone)
         user_id = user.get("id")
+        
+        subtotal = item_price or 0
+        tax_amount = 0
+        total_amount = subtotal + tax_amount
         
         order_data = {
             "user_id": user_id,
             "wa_id": wa_id,
             "customer_phone": customer_phone,
-            # Don't set order_number - let database auto-generate (SERIAL)
             "item_id": item_id,
             "item_name": item_name,
             "item_price": item_price,
+            "subtotal": subtotal,
+            "tax_amount": tax_amount,
+            "total_amount": total_amount,
             "quantity": 1,
-            "status": "placed",
+            "status": "pending_payment",
             "order_source": "bot_menu",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         result = db.table("orders").insert(order_data).execute()
         logger.info(f"Order created for {wa_id}: {item_name}")
         
-        # Invalidate order history cache
+        order = result.data[0] if result.data else order_data
         cache.delete(f"order_history:{wa_id}")
+        cache.set(f"pending_order:{wa_id}", order, 1800)
         
-        return result.data[0] if result.data else order_data
+        return order
 
     @staticmethod
     async def get_order_history(wa_id: str, limit: int = 10) -> list:
@@ -376,14 +453,14 @@ class Database:
         
         db = get_supabase()
         result = db.table("orders")\
-            .select("order_number, item_name, items, total_amount, status, created_at")\
+            .select("order_number, item_name, items, total_amount, status, payment_method, payment_status, created_at")\
             .eq("wa_id", wa_id)\
             .order("created_at", desc=True)\
             .limit(limit)\
             .execute()
         
         orders = result.data
-        cache.set(cache_key, orders, 60)  # Cache for 1 minute
+        cache.set(cache_key, orders, 60)
         return orders
 
     @staticmethod
@@ -403,7 +480,7 @@ class Database:
             .execute()
         
         menu_items = result.data
-        cache.set(cache_key, menu_items, 600)  # Cache for 10 minutes
+        cache.set(cache_key, menu_items, 600)
         return menu_items
 
     @staticmethod
@@ -412,7 +489,6 @@ class Database:
         if not config.ENABLE_MESSAGE_LOGGING:
             return
         
-        # Log to database in background (non-blocking)
         asyncio.create_task(Database._insert_message_log(wa_id, direction, message_type, content, status, error))
     
     @staticmethod
@@ -439,43 +515,32 @@ class Database:
 class RateLimiter:
     """Optimized rate limiter using in-memory cache + Supabase backup."""
     
-    _rate_limits: Dict[str, tuple[int, float]] = {}  # {wa_id: (count, window_start_timestamp)}
+    _rate_limits: Dict[str, tuple[int, float]] = {}
     _last_cleanup = datetime.now()
     
     @staticmethod
     async def check_rate_limit(wa_id: str) -> tuple[bool, int]:
-        """
-        Check if user is within rate limit (in-memory first for speed).
-        Returns (is_allowed, remaining_requests)
-        """
-        # Cleanup old entries periodically
+        """Check if user is within rate limit."""
         await RateLimiter._cleanup_old_entries()
         
         now = datetime.now(timezone.utc)
         window_start = now.replace(second=0, microsecond=0)
         window_timestamp = window_start.timestamp()
         
-        # Check in-memory first
         if wa_id in RateLimiter._rate_limits:
             count, stored_window = RateLimiter._rate_limits[wa_id]
             
-            # Check if window expired
             if stored_window < window_timestamp:
-                # New window
                 RateLimiter._rate_limits[wa_id] = (1, window_timestamp)
                 return True, config.RATE_LIMIT_REQUESTS - 1
             
-            # Same window
             if count >= config.RATE_LIMIT_REQUESTS:
                 return False, 0
             
             RateLimiter._rate_limits[wa_id] = (count + 1, window_timestamp)
             return True, config.RATE_LIMIT_REQUESTS - count - 1
         
-        # First request in this window
         RateLimiter._rate_limits[wa_id] = (1, window_timestamp)
-        
-        # Sync to database in background (for persistence across restarts)
         asyncio.create_task(RateLimiter._sync_to_db(wa_id, window_start.isoformat(), 1))
         
         return True, config.RATE_LIMIT_REQUESTS - 1
@@ -498,14 +563,13 @@ class RateLimiter:
         """Sync rate limit to database in background."""
         try:
             db = get_supabase()
-            # Upsert (update or insert)
             db.table("rate_limits").upsert({
                 "wa_id": wa_id,
                 "window_start": window_start,
                 "request_count": count,
             }).execute()
         except Exception:
-            pass  # Silently fail, in-memory is primary
+            pass
 
 
 # ============================================================
@@ -555,7 +619,6 @@ class WhatsAppAPI:
         }
         result = await cls.send(payload)
         
-        # Log in background if enabled
         if config.ENABLE_MESSAGE_LOGGING:
             asyncio.create_task(Database.log_message(to, "outbound", "text", {"body": text}))
         
@@ -581,7 +644,6 @@ class WhatsAppAPI:
         }
         result = await cls.send(payload)
         
-        # Log in background if enabled
         if config.ENABLE_MESSAGE_LOGGING:
             asyncio.create_task(Database.log_message(to, "outbound", "buttons", payload["interactive"]))
         
@@ -605,7 +667,6 @@ class WhatsAppAPI:
         }
         result = await cls.send(payload)
         
-        # Log in background if enabled
         if config.ENABLE_MESSAGE_LOGGING:
             asyncio.create_task(Database.log_message(to, "outbound", "list", payload["interactive"]))
         
@@ -614,7 +675,6 @@ class WhatsAppAPI:
     @classmethod
     async def send_catalogue_message(cls, to: str, body_text: str, catalogue_id: str = None) -> dict:
         """Send product catalogue message."""
-        # If no catalogue_id provided, use single-product-message (shows all products)
         payload = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -633,7 +693,6 @@ class WhatsAppAPI:
         
         result = await cls.send(payload)
         
-        # Log in background if enabled
         if config.ENABLE_MESSAGE_LOGGING:
             asyncio.create_task(Database.log_message(to, "outbound", "catalogue", payload["interactive"]))
         
@@ -656,6 +715,110 @@ class WhatsAppAPI:
             signature = signature[7:]
         
         return hmac.compare_digest(expected_signature, signature)
+
+
+# ============================================================
+# BILLING HELPER
+# ============================================================
+class BillingHelper:
+    """Helper class for generating bills and receipts."""
+    
+    @staticmethod
+    def format_currency(amount_paisa: int) -> str:
+        """Format amount in paisa to rupees string."""
+        rupees = amount_paisa / 100
+        return f"Rs {rupees:,.2f}"
+    
+    @staticmethod
+    def generate_bill(order: dict) -> str:
+        """Generate a formatted bill for an order."""
+        order_number = order.get("order_number", "N/A")
+        items = order.get("items", [])
+        subtotal = order.get("subtotal", 0)
+        tax_amount = order.get("tax_amount", 0)
+        total_amount = order.get("total_amount", 0)
+        
+        bill_lines = [
+            "╔════════════════════════════════╗",
+            "║        📋 ORDER BILL           ║",
+            "╚════════════════════════════════╝",
+            "",
+            f"Order #: {order_number}",
+            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            "─" * 34,
+            ""
+        ]
+        
+        # Handle both catalogue orders and legacy orders
+        if items and isinstance(items, list) and len(items) > 0:
+            # Catalogue order with multiple items
+            bill_lines.append("Items:")
+            for item in items:
+                name = item.get("name", "Unknown Item")
+                qty = item.get("quantity", 1)
+                price = item.get("item_price", 0)
+                item_total = item.get("item_total", price * qty)
+                
+                bill_lines.append(f"  • {name}")
+                bill_lines.append(f"    {qty} x {BillingHelper.format_currency(price)} = {BillingHelper.format_currency(item_total)}")
+        else:
+            # Legacy order with single item
+            item_name = order.get("item_name", "Unknown Item")
+            quantity = order.get("quantity", 1)
+            item_price = order.get("item_price", 0)
+            item_total = item_price * quantity
+            
+            bill_lines.append("Items:")
+            bill_lines.append(f"  • {item_name}")
+            bill_lines.append(f"    {quantity} x {BillingHelper.format_currency(item_price)} = {BillingHelper.format_currency(item_total)}")
+        
+        bill_lines.extend([
+            "",
+            "─" * 34,
+            f"Subtotal:        {BillingHelper.format_currency(subtotal)}",
+        ])
+        
+        if tax_amount > 0:
+            bill_lines.append(f"Tax:             {BillingHelper.format_currency(tax_amount)}")
+        
+        bill_lines.extend([
+            "─" * 34,
+            f"*Total:          {BillingHelper.format_currency(total_amount)}*",
+            "─" * 34,
+            "",
+            "Thank you for shopping with CPC! 🛍️"
+        ])
+        
+        return "\n".join(bill_lines)
+    
+    @staticmethod
+    def generate_payment_receipt(order: dict, payment_method: str) -> str:
+        """Generate payment receipt after successful payment."""
+        order_number = order.get("order_number", "N/A")
+        total_amount = order.get("total_amount", 0)
+        
+        receipt_lines = [
+            "╔════════════════════════════════╗",
+            "║      ✅ PAYMENT CONFIRMED      ║",
+            "╚════════════════════════════════╝",
+            "",
+            f"Order #: {order_number}",
+            f"Amount Paid: {BillingHelper.format_currency(total_amount)}",
+            f"Payment Method: {payment_method}",
+            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            "",
+            "─" * 34,
+            "",
+            "Your order has been confirmed! 🎉",
+            "We'll start preparing it right away.",
+            "",
+            "Track your order status by visiting",
+            "📦 Order History",
+            "",
+            "Thank you for your business! 🙏"
+        ]
+        
+        return "\n".join(receipt_lines)
 
 
 # ============================================================
@@ -682,18 +845,138 @@ class BotFlows:
         """Show Meta product catalogue."""
         await WhatsAppAPI.send_catalogue_message(
             to,
-            "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and place your order!"
+            "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and add to cart!"
         )
         
-        # Show back button after catalogue
-        await asyncio.sleep(1)  # Brief delay
+        await asyncio.sleep(1)
         await WhatsAppAPI.send_buttons(
             to,
-            "Need help with anything else?",
+            "After adding items to cart, proceed to checkout:",
             [
+                {"id": BTN_CHECKOUT, "title": "🛒 Checkout"},
                 {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
             ],
         )
+    
+    @staticmethod
+    async def show_checkout(to: str, wa_id: str):
+        """Show checkout with bill and payment options."""
+        # Get pending order
+        order = await Database.get_pending_order(wa_id)
+        
+        if not order:
+            await WhatsAppAPI.send_text(
+                to,
+                "❌ No pending order found.\n\nPlease add items to your cart first by browsing our store!"
+            )
+            await BotFlows.show_store(to)
+            return
+        
+        # Generate and send bill
+        bill = BillingHelper.generate_bill(order)
+        await WhatsAppAPI.send_text(to, bill)
+        
+        # Show payment options
+        await asyncio.sleep(1)
+        await WhatsAppAPI.send_buttons(
+            to,
+            "💳 *Select Payment Method*\n\nHow would you like to pay?",
+            [
+                {"id": BTN_PAY_BANK, "title": "🏦 Bank Transfer"},
+                {"id": BTN_PAY_CARD, "title": "💳 Card Payment"},
+                {"id": BTN_BACK_HOME, "title": "🔙 Cancel"},
+            ],
+        )
+    
+    @staticmethod
+    async def show_bank_transfer_details(to: str, wa_id: str):
+        """Show bank transfer details and instructions."""
+        order = await Database.get_pending_order(wa_id)
+        
+        if not order:
+            await WhatsAppAPI.send_text(to, "❌ Order not found. Please try again.")
+            await BotFlows.show_home(to)
+            return
+        
+        total_amount = order.get("total_amount", 0)
+        order_number = order.get("order_number", "N/A")
+        
+        bank_details = (
+            "🏦 *Bank Transfer Details*\n"
+            "─" * 34 + "\n\n"
+            f"*Bank Name:* {config.BANK_NAME}\n"
+            f"*Account Title:* {config.BANK_ACCOUNT_TITLE}\n"
+            f"*Account Number:* {config.BANK_ACCOUNT_NUMBER}\n"
+            f"*IBAN:* {config.BANK_IBAN}\n\n"
+            f"*Amount to Transfer:* {BillingHelper.format_currency(total_amount)}\n"
+            f"*Order Reference:* #{order_number}\n\n"
+            "─" * 34 + "\n\n"
+            "📝 *Instructions:*\n"
+            "1. Transfer the exact amount to the account above\n"
+            "2. Use Order Reference #{} in the description\n"
+            "3. After transfer, click 'Confirm Payment' below\n"
+            "4. Send us the payment screenshot for verification\n\n"
+            "⚠️ *Important:*\n"
+            "• Include order reference in transfer description\n"
+            "• Keep your transaction receipt\n"
+            "• Payment verification may take 5-10 minutes"
+        ).format(order_number)
+        
+        await WhatsAppAPI.send_text(to, bank_details)
+        
+        # Update order with payment method
+        await Database.update_order_payment(order["id"], "bank_transfer", "pending")
+        
+        await asyncio.sleep(1)
+        await WhatsAppAPI.send_buttons(
+            to,
+            "Have you completed the transfer?",
+            [
+                {"id": BTN_CONFIRM_PAYMENT, "title": "✅ Confirm Payment"},
+                {"id": BTN_BACK_HOME, "title": "🔙 Cancel"},
+            ],
+        )
+    
+    @staticmethod
+    async def show_card_payment(to: str):
+        """Show card payment message (coming soon)."""
+        await WhatsAppAPI.send_text(
+            to,
+            "💳 *Card Payment*\n\n"
+            "⚠️ Card payment integration is coming soon!\n\n"
+            "For now, please use Bank Transfer as your payment method.\n\n"
+            "We're working hard to bring you secure card payment options soon. "
+            "Thank you for your patience! 🙏"
+        )
+        
+        await asyncio.sleep(1)
+        await WhatsAppAPI.send_buttons(
+            to,
+            "Choose another payment method:",
+            [
+                {"id": BTN_PAY_BANK, "title": "🏦 Bank Transfer"},
+                {"id": BTN_BACK_HOME, "title": "🔙 Back to Menu"},
+            ],
+        )
+    
+    @staticmethod
+    async def confirm_payment(to: str, wa_id: str):
+        """Confirm payment and complete order."""
+        order = await Database.get_pending_order(wa_id)
+        
+        if not order:
+            await WhatsAppAPI.send_text(to, "❌ Order not found. Please try again.")
+            await BotFlows.show_home(to)
+            return
+        
+        # Update order status to confirmed
+        await Database.update_order_payment(order["id"], order.get("payment_method", "bank_transfer"), "confirmed")
+        
+        # Generate receipt
+        receipt = BillingHelper.generate_payment_receipt(order, "Bank Transfer")
+        await WhatsAppAPI.send_text(to, receipt)
+        
+        await BotFlows.show_home(to)
     
     @staticmethod
     async def show_history(to: str, wa_id: str):
@@ -712,20 +995,23 @@ class BotFlows:
         for order in orders:
             order_num = order.get("order_number", "N/A")
             status = order.get("status", "unknown")
+            payment_status = order.get("payment_status", "N/A")
             created = order.get("created_at", "")[:10]
             
-            # Handle both old (item_name) and new (items array) format
             if order.get("items"):
                 items = order.get("items", [])
                 item_names = ", ".join([item.get("name", "Item") for item in items[:2]])
                 if len(items) > 2:
                     item_names += f" (+{len(items)-2} more)"
                 total = order.get("total_amount", 0)
-                item_display = f"{item_names} - Rs {total // 100}"
+                item_display = f"{item_names} - {BillingHelper.format_currency(total)}"
             else:
                 item_display = order.get("item_name", "Unknown")
+                total = order.get("total_amount", 0)
+                item_display += f" - {BillingHelper.format_currency(total)}"
             
             status_emoji = {
+                "pending_payment": "⏳",
                 "placed": "🆕",
                 "confirmed": "✅",
                 "preparing": "👨‍🍳",
@@ -734,7 +1020,13 @@ class BotFlows:
                 "cancelled": "❌",
             }.get(status, "❓")
             
-            lines.append(f"{status_emoji} #{order_num}\n   {item_display}\n   {created} • {status.title()}\n")
+            payment_emoji = {
+                "pending": "⏳",
+                "confirmed": "✅",
+                "failed": "❌",
+            }.get(payment_status, "❓")
+            
+            lines.append(f"{status_emoji} #{order_num}\n   {item_display}\n   {created} • {status.replace('_', ' ').title()} {payment_emoji}\n")
         
         await WhatsAppAPI.send_text(to, "\n".join(lines))
         await BotFlows.show_home(to)
@@ -765,7 +1057,8 @@ class BotFlows:
             "• Quality products\n"
             "• Fast delivery\n"
             "• 24/7 customer support\n"
-            "• Secure payment options\n\n"
+            "• Secure payment options\n"
+            "• Easy returns & refunds\n\n"
             "Thank you for choosing CPC! 🙏"
         )
         await BotFlows.show_faq(to)
@@ -781,7 +1074,8 @@ class BotFlows:
             "📧 Email: support@cpc.com\n"
             "🌐 Website: www.cpc.com\n"
             "⏰ Hours: 9 AM - 9 PM (Mon-Sat)\n\n"
-            "Feel free to reach out anytime!"
+            "For payment queries, order tracking, or any other assistance,\n"
+            "feel free to reach out anytime!"
         )
         await BotFlows.show_faq(to)
     
@@ -793,7 +1087,7 @@ class BotFlows:
             "⏳ You're sending messages too quickly. Please wait a moment and try again."
         )
     
-    # Legacy flows (kept for backwards compatibility)
+    # Legacy flows
     @staticmethod
     async def show_menu(to: str):
         """Show menu with items (legacy)."""
@@ -802,17 +1096,16 @@ class BotFlows:
         if items:
             lines = ["🧾 *Menu*\n"]
             for item in items:
-                price_display = f"Rs {item['price'] // 100}"
+                price_display = BillingHelper.format_currency(item['price'])
                 lines.append(f"• {item['name']} — {price_display}")
             lines.append("\nTap *Order* to place an order.")
             menu_text = "\n".join(lines)
         else:
-            logger.warning("No menu items in database, using fallback menu")
             menu_text = (
                 "🧾 *Menu*\n"
-                "• Zinger Burger — Rs 450\n"
-                "• Pizza Slice — Rs 350\n"
-                "• Fries — Rs 200\n\n"
+                "• Zinger Burger — Rs 450.00\n"
+                "• Pizza Slice — Rs 350.00\n"
+                "• Fries — Rs 200.00\n\n"
                 "Tap *Order* to place an order."
             )
         
@@ -834,7 +1127,7 @@ class BotFlows:
         if items:
             rows = []
             for item in items:
-                price_display = f"Rs {item['price'] // 100}"
+                price_display = BillingHelper.format_currency(item['price'])
                 rows.append({
                     "id": item["item_id"],
                     "title": item["name"],
@@ -842,16 +1135,16 @@ class BotFlows:
                 })
         else:
             rows = [
-                {"id": ITEM_ZINGER, "title": "Zinger Burger", "description": "Rs 450"},
-                {"id": ITEM_PIZZA, "title": "Pizza Slice", "description": "Rs 350"},
-                {"id": ITEM_FRIES, "title": "Fries", "description": "Rs 200"},
+                {"id": ITEM_ZINGER, "title": "Zinger Burger", "description": "Rs 450.00"},
+                {"id": ITEM_PIZZA, "title": "Pizza Slice", "description": "Rs 350.00"},
+                {"id": ITEM_FRIES, "title": "Fries", "description": "Rs 200.00"},
             ]
         
         sections = [{"title": "Available items", "rows": rows}]
         
         await WhatsAppAPI.send_list(
             to,
-            "Select an item to place your order:",
+            "Select an item to add to cart:",
             "View items",
             sections,
         )
@@ -880,7 +1173,6 @@ def extract_message(data: dict) -> Optional[dict]:
         messages = value.get("messages", [])
         
         if not messages:
-            # Check for order webhook
             orders = value.get("orders", [])
             if orders:
                 return {
@@ -902,7 +1194,6 @@ def extract_message(data: dict) -> Optional[dict]:
             "type": msg_type,
         }
         
-        # Handle order messages from catalogue
         if msg_type == "order":
             result["kind"] = "order"
             result["order_data"] = msg.get("order", {})
@@ -921,7 +1212,6 @@ def extract_message(data: dict) -> Optional[dict]:
                 result["reply_id"] = interactive["list_reply"]["id"]
                 result["title"] = interactive["list_reply"]["title"]
             elif itype == "nfm_reply":
-                # Catalogue/order related
                 result["kind"] = "order"
                 result["order_data"] = interactive.get("nfm_reply", {})
             else:
@@ -948,15 +1238,12 @@ def extract_message(data: dict) -> Optional[dict]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """App lifespan events."""
-    # Startup
-    logger.info("Starting WhatsApp Bot (Meta Catalogue Edition)...")
+    logger.info("Starting WhatsApp Bot (Billing & Payment Edition)...")
     
     missing = config.validate()
     if missing:
         logger.warning(f"⚠️ Missing configuration: {', '.join(missing)}")
-        logger.warning("Some features may not work until environment variables are set")
     
-    # Test Supabase connection
     if is_supabase_configured():
         try:
             db = get_supabase()
@@ -964,24 +1251,21 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Supabase connection established")
         except Exception as e:
             logger.warning(f"⚠️ Supabase connection test failed: {type(e).__name__}")
-    else:
-        logger.warning("⚠️ Supabase not configured - database features disabled")
     
     logger.info(f"🚀 WhatsApp Bot started in {config.ENVIRONMENT} mode")
-    logger.info(f"⚡ Features: Catalogue integration, Caching enabled, Message logging: {config.ENABLE_MESSAGE_LOGGING}")
+    logger.info(f"⚡ Features: Catalogue, Billing, Payments (Bank Transfer, Card Coming Soon)")
     
     yield
     
-    # Shutdown
     logger.info("WhatsApp Bot shutting down")
     if _http_client:
         await _http_client.aclose()
 
 
 app = FastAPI(
-    title="WhatsApp Button Bot with Meta Catalogue",
-    description="Production-ready WhatsApp bot with Meta Catalogue Integration + Supabase",
-    version="2.2.0",
+    title="WhatsApp Button Bot with Billing & Payment",
+    description="Production-ready WhatsApp bot with Meta Catalogue + Billing + Payment Integration",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -1001,10 +1285,10 @@ app.add_middleware(
 async def root():
     """Root endpoint."""
     return {
-        "name": "WhatsApp Button Bot with Meta Catalogue",
-        "version": "2.2.0",
+        "name": "WhatsApp Button Bot with Billing & Payment",
+        "version": "2.3.0",
         "status": "running",
-        "features": ["meta_catalogue", "order_history", "faq", "caching"]
+        "features": ["meta_catalogue", "billing_system", "payment_options", "order_history"]
     }
 
 
@@ -1015,7 +1299,7 @@ async def health():
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "environment": config.ENVIRONMENT,
-        "version": "2.2.0",
+        "version": "2.3.0",
         "checks": {}
     }
     
@@ -1054,12 +1338,11 @@ async def verify_webhook(
 
 @app.post("/webhook/whatsapp")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
-    """Handle incoming WhatsApp messages (optimized with catalogue support)."""
+    """Handle incoming WhatsApp messages with billing and payment."""
     start_time = datetime.now()
     
     body = await request.body()
     
-    # Verify signature (if configured)
     signature = request.headers.get("X-Hub-Signature-256", "")
     if config.WHATSAPP_APP_SECRET and not WhatsAppAPI.verify_signature(body, signature):
         logger.warning("Invalid webhook signature")
@@ -1079,30 +1362,24 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
     wa_id = msg["from"]
     msg_id = msg["id"]
     
-    # Deduplication check (fast in-memory)
     if await Database.already_processed(msg_id):
         logger.debug(f"Duplicate message ignored: {msg_id}")
         return JSONResponse({"status": "duplicate"}, status_code=200)
     
-    # Mark as processed immediately (in-memory + background DB sync)
     await Database.mark_processed(msg_id, wa_id, msg.get("kind"))
     
-    # Check if user is blocked (cached)
     if await Database.is_user_blocked(wa_id):
         logger.info(f"Blocked user attempted contact: {wa_id}")
         return JSONResponse({"status": "blocked"}, status_code=200)
     
-    # Rate limiting (in-memory for speed)
     is_allowed, remaining = await RateLimiter.check_rate_limit(wa_id)
     if not is_allowed:
         logger.warning(f"Rate limit exceeded for {wa_id}")
         await BotFlows.show_rate_limited(to)
         return JSONResponse({"status": "rate_limited"}, status_code=200)
     
-    # Get or create user (cached)
     await Database.get_or_create_user(wa_id, to)
     
-    # Log message in background if enabled
     if config.ENABLE_MESSAGE_LOGGING:
         background_tasks.add_task(Database.log_message, wa_id, "inbound", msg.get("kind", "unknown"), msg)
     
@@ -1111,27 +1388,25 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         if msg["kind"] == "order":
             order_data = msg.get("order_data", {})
             
-            # Create order in database
             order = await Database.create_order_from_catalogue(
                 wa_id=wa_id,
                 customer_phone=to,
                 order_data=order_data
             )
             
-            # Send confirmation
-            order_number = order.get("order_number", "N/A")
-            total_amount = order.get("total_amount", 0)
+            # Send bill and ask for checkout
+            bill = BillingHelper.generate_bill(order)
+            await WhatsAppAPI.send_text(to, bill)
             
-            await WhatsAppAPI.send_text(
+            await asyncio.sleep(1)
+            await WhatsAppAPI.send_buttons(
                 to,
-                f"✅ *Order Confirmed!*\n\n"
-                f"Order #{order_number}\n"
-                f"Total: Rs {total_amount // 100}\n\n"
-                f"We've received your order and will start preparing it shortly. "
-                f"You'll receive updates on your order status.\n\n"
-                f"Thank you for shopping with CPC! 🙏"
+                "Your cart is ready! Proceed to checkout to complete your order:",
+                [
+                    {"id": BTN_CHECKOUT, "title": "🛒 Checkout"},
+                    {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
+                ],
             )
-            await BotFlows.show_home(to)
             
             processing_time = (datetime.now() - start_time).total_seconds()
             logger.info(f"Order webhook processed in {processing_time:.3f}s")
@@ -1141,18 +1416,20 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         if msg["kind"] == "text":
             text = (msg.get("text") or "").strip().lower()
             
-            if text in ("hi", "hello", "start", "hey", "hola", "menu", "home"):
-                await BotFlows.show_home(to)
-            elif text in ("store", "shop", "catalogue", "catalog"):
-                await BotFlows.show_store(to)
-            elif text in ("history", "orders", "my orders"):
-                await BotFlows.show_history(to, wa_id)
-            elif text in ("faq", "help", "info"):
-                await BotFlows.show_faq(to)
-            elif text in ("about", "about us"):
-                await BotFlows.show_about_us(to)
-            elif text in ("contact", "support"):
-                await BotFlows.show_contact(to)
+            text_handlers = {
+                ("hi", "hello", "start", "hey", "hola", "menu", "home"): lambda: BotFlows.show_home(to),
+                ("store", "shop", "catalogue", "catalog"): lambda: BotFlows.show_store(to),
+                ("checkout", "cart", "pay"): lambda: BotFlows.show_checkout(to, wa_id),
+                ("history", "orders", "my orders"): lambda: BotFlows.show_history(to, wa_id),
+                ("faq", "help", "info"): lambda: BotFlows.show_faq(to),
+                ("about", "about us"): lambda: BotFlows.show_about_us(to),
+                ("contact", "support"): lambda: BotFlows.show_contact(to),
+            }
+            
+            for keywords, handler in text_handlers.items():
+                if text in keywords:
+                    await handler()
+                    break
             else:
                 await BotFlows.show_home(to)
             
@@ -1166,12 +1443,16 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             
             handlers = {
                 BTN_VIEW_STORE: lambda: BotFlows.show_store(to),
+                BTN_CHECKOUT: lambda: BotFlows.show_checkout(to, wa_id),
                 BTN_HISTORY: lambda: BotFlows.show_history(to, wa_id),
                 BTN_FAQ: lambda: BotFlows.show_faq(to),
                 BTN_ABOUT_US: lambda: BotFlows.show_about_us(to),
                 BTN_CONTACT: lambda: BotFlows.show_contact(to),
                 BTN_BACK_HOME: lambda: BotFlows.show_home(to),
-                # Legacy buttons
+                BTN_PAY_BANK: lambda: BotFlows.show_bank_transfer_details(to, wa_id),
+                BTN_PAY_CARD: lambda: BotFlows.show_card_payment(to),
+                BTN_CONFIRM_PAYMENT: lambda: BotFlows.confirm_payment(to, wa_id),
+                # Legacy
                 BTN_MENU: lambda: BotFlows.show_menu(to),
                 BTN_ORDER: lambda: BotFlows.show_order_list(to),
                 BTN_MORE: lambda: BotFlows.show_more(to),
@@ -1192,12 +1473,10 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             rid = msg["reply_id"]
             title = msg.get("title", "Item")
             
-            # Get menu items (cached)
             items = await Database.get_menu_items()
             item_map = {item["item_id"]: item for item in items}
             
             if not item_map:
-                logger.warning("No menu items in database, using fallback items")
                 item_map = {
                     ITEM_ZINGER: {"name": "Zinger Burger", "price": 45000, "item_id": ITEM_ZINGER},
                     ITEM_PIZZA: {"name": "Pizza Slice", "price": 35000, "item_id": ITEM_PIZZA},
@@ -1206,23 +1485,28 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             
             if rid in item_map:
                 item = item_map[rid]
-                price_display = f"Rs {item['price'] // 100}"
-                item_display = f"{item['name']} — {price_display}"
                 
-                await Database.create_order(
+                order = await Database.create_order(
                     wa_id=wa_id,
                     customer_phone=to,
                     item_id=rid,
-                    item_name=item_display,
+                    item_name=item['name'],
                     item_price=item['price'],
                 )
                 
-                await WhatsAppAPI.send_text(
+                # Send bill and checkout option
+                bill = BillingHelper.generate_bill(order)
+                await WhatsAppAPI.send_text(to, bill)
+                
+                await asyncio.sleep(1)
+                await WhatsAppAPI.send_buttons(
                     to,
-                    f"✅ Order placed: *{item_display}*\n\n"
-                    "We'll notify you when it's ready!"
+                    "Proceed to checkout?",
+                    [
+                        {"id": BTN_CHECKOUT, "title": "🛒 Checkout"},
+                        {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
+                    ],
                 )
-                await BotFlows.show_home(to)
             else:
                 await WhatsAppAPI.send_text(to, "❓ I didn't recognize that item. Please try again.")
                 await BotFlows.show_order_list(to)
@@ -1271,10 +1555,19 @@ async def get_stats():
             .gte("created_at", today_start.isoformat())\
             .execute()
         
-        # Get catalogue vs bot menu orders
         catalogue_orders = db.table("orders")\
             .select("id", count="exact")\
             .eq("order_source", "meta_catalogue")\
+            .execute()
+        
+        pending_payments = db.table("orders")\
+            .select("id", count="exact")\
+            .eq("status", "pending_payment")\
+            .execute()
+        
+        confirmed_payments = db.table("orders")\
+            .select("id", count="exact")\
+            .eq("payment_status", "confirmed")\
             .execute()
         
         return {
@@ -1283,9 +1576,10 @@ async def get_stats():
             "orders_today": orders_today.count or 0,
             "catalogue_orders": catalogue_orders.count or 0,
             "bot_menu_orders": (orders_result.count or 0) - (catalogue_orders.count or 0),
+            "pending_payments": pending_payments.count or 0,
+            "confirmed_payments": confirmed_payments.count or 0,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "cache_enabled": True,
-            "message_logging": config.ENABLE_MESSAGE_LOGGING,
+            "features": ["billing", "bank_transfer", "card_coming_soon"],
         }
     except Exception as e:
         logger.error(f"Error getting stats: {type(e).__name__}")
