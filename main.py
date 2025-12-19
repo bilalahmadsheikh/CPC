@@ -727,10 +727,17 @@ class WhatsAppAPI:
 
             if response.status_code == 200:
                 data = response.json()
+
+                # Log the FULL API response for debugging
+                logger.info(f"🔍 Full API response for {product_retailer_id}: {json.dumps(data, indent=2)}")
+
                 # Direct product fetch returns the product object directly
                 product_name = data.get("name", "Unknown Item")
                 product_price = data.get("price", "0")
-                logger.info(f"✅ Fetched from catalogue {catalog_id}: {product_name} - Price: '{product_price}' (type: {type(product_price).__name__})")
+
+                # Log what we extracted
+                logger.info(f"✅ Extracted: name='{product_name}', price='{product_price}'")
+
                 return {
                     "name": product_name,
                     "price": product_price,
