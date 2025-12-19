@@ -714,11 +714,12 @@ class WhatsAppAPI:
                 "Authorization": f"Bearer {config.WHATSAPP_ACCESS_TOKEN}",
             }
 
-            # Try to get product from catalog
-            url = f"{cls.BASE_URL}/{catalog_id}/products"
+            # Meta's Commerce API: Access product directly by catalog_id and product_retailer_id
+            # Format: /{catalog_id}/products?fields=...&ids={product_retailer_id}
+            # OR: /{catalog_id}/items/{product_retailer_id}
+            url = f"{cls.BASE_URL}/{catalog_id}/products/{product_retailer_id}"
             params = {
-                "fields": "name,retailer_id,price,currency,image_url",
-                "filter": json.dumps({"retailer_id": product_retailer_id})
+                "fields": "name,retailer_id,price,currency,image_url"
             }
 
             client = get_http_client()
@@ -726,21 +727,19 @@ class WhatsAppAPI:
 
             if response.status_code == 200:
                 data = response.json()
-                products = data.get("data", [])
-                if products:
-                    product = products[0]
-                    product_name = product.get("name", "Unknown Item")
-                    product_price = product.get("price", "0")
-                    logger.info(f"✅ Fetched from catalogue: {product_name} - Price: '{product_price}' (type: {type(product_price).__name__})")
-                    return {
-                        "name": product_name,
-                        "price": product_price,
-                        "currency": product.get("currency", "PKR"),
-                        "image_url": product.get("image_url")
-                    }
+                # Direct product fetch returns the product object directly
+                product_name = data.get("name", "Unknown Item")
+                product_price = data.get("price", "0")
+                logger.info(f"✅ Fetched from catalogue {catalog_id}: {product_name} - Price: '{product_price}' (type: {type(product_price).__name__})")
+                return {
+                    "name": product_name,
+                    "price": product_price,
+                    "currency": data.get("currency", "PKR"),
+                    "image_url": data.get("image_url")
+                }
 
             logger.warning(f"❌ Could not fetch product details for retailer_id: {product_retailer_id} from catalogue: {catalog_id}")
-            logger.warning(f"API Response status: {response.status_code}, body: {response.text[:200]}")
+            logger.warning(f"API Response status: {response.status_code}, body: {response.text[:500]}")
             return {"name": "Unknown Item", "price": "0"}
 
         except Exception as e:
@@ -775,7 +774,7 @@ class BillingHelper:
     @staticmethod
     def format_currency(amount_paisa: int) -> str:
         """Format amount in paisa to rupees string."""
-        rupees = amount_paisa / 100
+        rupees = amount_paisa *100
         return f"Rs {rupees:,.0f}"
     
     @staticmethod
