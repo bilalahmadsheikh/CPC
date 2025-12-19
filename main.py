@@ -45,6 +45,7 @@ class Config:
     WHATSAPP_VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "cpc")
     WHATSAPP_APP_SECRET: str = os.getenv("WHATSAPP_APP_SECRET", "")
     WHATSAPP_BUSINESS_ID: str = os.getenv("WHATSAPP_BUSINESS_ID", "")
+    CATALOGUE_ID: str = os.getenv("CATALOGUE_ID", "")
     
     # Supabase
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
@@ -173,16 +174,7 @@ BTN_CHECKOUT = "BTN_CHECKOUT"
 BTN_PAY_BANK = "BTN_PAY_BANK"
 BTN_PAY_CARD = "BTN_PAY_CARD"
 BTN_CONFIRM_PAYMENT = "BTN_CONFIRM_PAYMENT"
-
-# Legacy buttons
-BTN_MENU = "BTN_MENU"
-BTN_ORDER = "BTN_ORDER"
-BTN_MORE = "BTN_MORE"
 BTN_CONTACT = "BTN_CONTACT"
-
-ITEM_ZINGER = "ITEM_ZINGER"
-ITEM_PIZZA = "ITEM_PIZZA"
-ITEM_FRIES = "ITEM_FRIES"
 
 
 # ============================================================
@@ -302,27 +294,30 @@ class Database:
         
         # Log the incoming order data for debugging
         logger.info(f"Received order_data: {json.dumps(order_data, indent=2)}")
-        
-        # Extract catalog ID
-        catalog_id = order_data.get("catalog_id") or order_data.get("catalogue_id")
-        
+
+        # Use configured CATALOGUE_ID for all operations
+        catalog_id = config.CATALOGUE_ID or order_data.get("catalog_id") or order_data.get("catalogue_id")
+
+        if not catalog_id:
+            logger.warning("No catalog_id found in order data or configuration")
+
         # Extract and calculate order details properly
         items = order_data.get("product_items", [])
         if not items:
             items = order_data.get("items", [])
-        
+
         # Calculate totals correctly
         subtotal = 0
         processed_items = []
-        
+
         for item in items:
             # Get product retailer ID
             product_retailer_id = item.get("product_retailer_id", "")
-            
+
             # Meta doesn't send product names in webhook!
-            # We need to fetch it from their API
-            if catalog_id and product_retailer_id:
-                product_details = await WhatsAppAPI.get_product_details(catalog_id, product_retailer_id)
+            # We need to fetch it from their API using our configured CATALOGUE_ID
+            if product_retailer_id:
+                product_details = await WhatsAppAPI.get_product_details(product_retailer_id, catalog_id)
                 item_name = product_details.get("name", "Unknown Item")
                 # Use API price if webhook price seems wrong (like 5000 paisa = Rs 50)
                 api_price = product_details.get("price", "0")
@@ -337,9 +332,9 @@ class Database:
             else:
                 # Fallback: Try to extract from webhook (though it usually doesn't have name)
                 item_name = (
-                    item.get("name") or 
-                    item.get("product_name") or 
-                    item.get("title") or 
+                    item.get("name") or
+                    item.get("product_name") or
+                    item.get("title") or
                     "Unknown Item"
                 )
                 item_price = int(item.get("item_price", 0))
@@ -445,42 +440,6 @@ class Database:
         return result.data[0] if result.data else {}
 
     @staticmethod
-    async def create_order(wa_id: str, customer_phone: str, item_id: str, item_name: str, item_price: int = None) -> dict:
-        """Create a new order (legacy method)."""
-        db = get_supabase()
-        
-        user = await Database.get_or_create_user(wa_id, customer_phone)
-        user_id = user.get("id")
-        
-        subtotal = item_price or 0
-        tax_amount = 0
-        total_amount = subtotal + tax_amount
-        
-        order_data = {
-            "user_id": user_id,
-            "wa_id": wa_id,
-            "customer_phone": customer_phone,
-            "item_id": item_id,
-            "item_name": item_name,
-            "item_price": item_price,
-            "subtotal": subtotal,
-            "tax_amount": tax_amount,
-            "total_amount": total_amount,
-            "quantity": 1,
-            "status": "pending_payment",
-            "order_source": "bot_menu",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        result = db.table("orders").insert(order_data).execute()
-        logger.info(f"Order created for {wa_id}: {item_name}")
-        
-        order = result.data[0] if result.data else order_data
-        cache.delete(f"order_history:{wa_id}")
-        cache.set(f"pending_order:{wa_id}", order, 1800)
-        
-        return order
-
-    @staticmethod
     async def get_order_history(wa_id: str, limit: int = 10) -> list:
         """Get order history for a user (cached)."""
         cache_key = f"order_history:{wa_id}"
@@ -500,26 +459,6 @@ class Database:
         orders = result.data
         cache.set(cache_key, orders, 60)
         return orders
-
-    @staticmethod
-    async def get_menu_items() -> list:
-        """Get available menu items (heavily cached)."""
-        cache_key = "menu_items:all"
-        cached_menu = cache.get(cache_key)
-        
-        if cached_menu:
-            return cached_menu
-        
-        db = get_supabase()
-        result = db.table("menu_items")\
-            .select("*")\
-            .eq("is_available", True)\
-            .order("sort_order")\
-            .execute()
-        
-        menu_items = result.data
-        cache.set(cache_key, menu_items, 600)
-        return menu_items
 
     @staticmethod
     async def log_message(wa_id: str, direction: str, message_type: str, content: dict, status: str = "success", error: str = None):
@@ -711,9 +650,12 @@ class WhatsAppAPI:
         return result
     
     @classmethod
-    async def send_catalogue_message(cls, to: str, body_text: str, catalogue_id: str = None) -> dict:
-        """Send product catalogue message."""
+    async def send_catalogue_message(cls, to: str, body_text: str) -> dict:
+        """Send product catalogue message using configured CATALOGUE_ID."""
         try:
+            if not config.CATALOGUE_ID:
+                raise RuntimeError("CATALOGUE_ID is not configured")
+
             payload = {
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
@@ -726,42 +668,52 @@ class WhatsAppAPI:
                     },
                     "action": {
                         "name": "catalog_message",
+                        "parameters": {
+                            "thumbnail_product_retailer_id": config.CATALOGUE_ID
+                        }
                     }
                 }
             }
-            
+
             result = await cls.send(payload)
-            
+
             if config.ENABLE_MESSAGE_LOGGING:
                 asyncio.create_task(Database.log_message(to, "outbound", "catalogue", payload["interactive"]))
-            
+
             return result
         except Exception as e:
             logger.error(f"Failed to send catalogue message: {type(e).__name__} - {str(e)}")
             raise
     
     @classmethod
-    async def get_product_details(cls, catalog_id: str, product_retailer_id: str) -> dict:
-        """Fetch product details from Meta Catalogue API."""
+    async def get_product_details(cls, product_retailer_id: str, catalog_id: str = None) -> dict:
+        """Fetch product details from Meta Catalogue API using configured CATALOGUE_ID."""
+        # Use provided catalog_id or fall back to configured CATALOGUE_ID
+        catalog_id = catalog_id or config.CATALOGUE_ID
+
         if not config.WHATSAPP_ACCESS_TOKEN:
             logger.error("Cannot fetch product details: WHATSAPP_ACCESS_TOKEN not set")
             return {"name": "Unknown Item", "price": 0}
-        
+
+        if not catalog_id:
+            logger.error("Cannot fetch product details: No catalog_id provided or configured")
+            return {"name": "Unknown Item", "price": 0}
+
         try:
             headers = {
                 "Authorization": f"Bearer {config.WHATSAPP_ACCESS_TOKEN}",
             }
-            
+
             # Try to get product from catalog
             url = f"{cls.BASE_URL}/{catalog_id}/products"
             params = {
                 "fields": "name,retailer_id,price,currency,image_url",
                 "filter": json.dumps({"retailer_id": product_retailer_id})
             }
-            
+
             client = get_http_client()
             response = await client.get(url, headers=headers, params=params)
-            
+
             if response.status_code == 200:
                 data = response.json()
                 products = data.get("data", [])
@@ -774,36 +726,13 @@ class WhatsAppAPI:
                         "currency": product.get("currency", "PKR"),
                         "image_url": product.get("image_url")
                     }
-            
+
             logger.warning(f"Could not fetch product details for {product_retailer_id}")
             return {"name": "Unknown Item", "price": 0}
-            
+
         except Exception as e:
             logger.error(f"Error fetching product details: {type(e).__name__} - {str(e)}")
             return {"name": "Unknown Item", "price": 0}
-        """Send product catalogue message."""
-        payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": to,
-            "type": "interactive",
-            "interactive": {
-                "type": "catalog_message",
-                "body": {
-                    "text": body_text
-                },
-                "action": {
-                    "name": "catalog_message",
-                }
-            }
-        }
-        
-        result = await cls.send(payload)
-        
-        if config.ENABLE_MESSAGE_LOGGING:
-            asyncio.create_task(Database.log_message(to, "outbound", "catalogue", payload["interactive"]))
-        
-        return result
     
     @staticmethod
     def verify_signature(payload: bytes, signature: str) -> bool:
@@ -1242,81 +1171,6 @@ class BotFlows:
             to,
             "⏳ You're sending messages too quickly. Please wait a moment and try again."
         )
-    
-    # Legacy flows
-    @staticmethod
-    async def show_menu(to: str):
-        """Show menu with items (legacy)."""
-        items = await Database.get_menu_items()
-        
-        if items:
-            lines = ["🧾 *Menu*\n"]
-            for item in items:
-                price_display = BillingHelper.format_currency(item['price'])
-                lines.append(f"• {item['name']} — {price_display}")
-            lines.append("\nTap *Order* to place an order.")
-            menu_text = "\n".join(lines)
-        else:
-            menu_text = (
-                "🧾 *Menu*\n"
-                "• Zinger Burger — Rs 450.00\n"
-                "• Pizza Slice — Rs 350.00\n"
-                "• Fries — Rs 200.00\n\n"
-                "Tap *Order* to place an order."
-            )
-        
-        await WhatsAppAPI.send_buttons(
-            to,
-            menu_text,
-            [
-                {"id": BTN_ORDER, "title": "🛒 Order"},
-                {"id": BTN_BACK_HOME, "title": "🔙 Back"},
-                {"id": BTN_MORE, "title": "⚙️ More"},
-            ],
-        )
-    
-    @staticmethod
-    async def show_order_list(to: str):
-        """Show order selection list (legacy)."""
-        items = await Database.get_menu_items()
-        
-        if items:
-            rows = []
-            for item in items:
-                price_display = BillingHelper.format_currency(item['price'])
-                rows.append({
-                    "id": item["item_id"],
-                    "title": item["name"],
-                    "description": price_display,
-                })
-        else:
-            rows = [
-                {"id": ITEM_ZINGER, "title": "Zinger Burger", "description": "Rs 450.00"},
-                {"id": ITEM_PIZZA, "title": "Pizza Slice", "description": "Rs 350.00"},
-                {"id": ITEM_FRIES, "title": "Fries", "description": "Rs 200.00"},
-            ]
-        
-        sections = [{"title": "Available items", "rows": rows}]
-        
-        await WhatsAppAPI.send_list(
-            to,
-            "Select an item to add to cart:",
-            "View items",
-            sections,
-        )
-    
-    @staticmethod
-    async def show_more(to: str):
-        """Show more options (legacy)."""
-        await WhatsAppAPI.send_buttons(
-            to,
-            "More options:",
-            [
-                {"id": BTN_HISTORY, "title": "📦 Order history"},
-                {"id": BTN_CONTACT, "title": "📞 Contact us"},
-                {"id": BTN_BACK_HOME, "title": "🔙 Back"},
-            ],
-        )
 
 
 # ============================================================
@@ -1615,10 +1469,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 BTN_PAY_BANK: lambda: BotFlows.show_bank_transfer_details(to, wa_id),
                 BTN_PAY_CARD: lambda: BotFlows.show_card_payment(to),
                 BTN_CONFIRM_PAYMENT: lambda: BotFlows.confirm_payment(to, wa_id),
-                # Legacy
-                BTN_MENU: lambda: BotFlows.show_menu(to),
-                BTN_ORDER: lambda: BotFlows.show_order_list(to),
-                BTN_MORE: lambda: BotFlows.show_more(to),
             }
             
             handler = handlers.get(rid)
@@ -1629,53 +1479,6 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             
             processing_time = (datetime.now() - start_time).total_seconds()
             logger.info(f"Button webhook processed in {processing_time:.3f}s")
-            return JSONResponse({"status": "ok"}, status_code=200)
-        
-        # Handle list selection (legacy ordering)
-        if msg["kind"] == "list":
-            rid = msg["reply_id"]
-            title = msg.get("title", "Item")
-            
-            items = await Database.get_menu_items()
-            item_map = {item["item_id"]: item for item in items}
-            
-            if not item_map:
-                item_map = {
-                    ITEM_ZINGER: {"name": "Zinger Burger", "price": 45000, "item_id": ITEM_ZINGER},
-                    ITEM_PIZZA: {"name": "Pizza Slice", "price": 35000, "item_id": ITEM_PIZZA},
-                    ITEM_FRIES: {"name": "Fries", "price": 20000, "item_id": ITEM_FRIES},
-                }
-            
-            if rid in item_map:
-                item = item_map[rid]
-                
-                order = await Database.create_order(
-                    wa_id=wa_id,
-                    customer_phone=to,
-                    item_id=rid,
-                    item_name=item['name'],
-                    item_price=item['price'],
-                )
-                
-                # Send bill and checkout option
-                bill = BillingHelper.generate_bill(order)
-                await WhatsAppAPI.send_text(to, bill)
-                
-                await asyncio.sleep(1)
-                await WhatsAppAPI.send_buttons(
-                    to,
-                    "Proceed to checkout?",
-                    [
-                        {"id": BTN_CHECKOUT, "title": "🛒 Checkout"},
-                        {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
-                    ],
-                )
-            else:
-                await WhatsAppAPI.send_text(to, "❓ I didn't recognize that item. Please try again.")
-                await BotFlows.show_order_list(to)
-            
-            processing_time = (datetime.now() - start_time).total_seconds()
-            logger.info(f"List webhook processed in {processing_time:.3f}s")
             return JSONResponse({"status": "ok"}, status_code=200)
         
         # Handle other message types
