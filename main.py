@@ -321,25 +321,26 @@ class Database:
                 item_name = product_details.get("name", "Unknown Item")
 
                 # Get price from API or webhook
-                # IMPORTANT: Meta's API and webhook return prices in the smallest currency unit
-                # For PKR: 100 paisa = 1 rupee, so price "500000" = Rs 5000
-                # The API returns it as a string, webhook as integer
+                # Meta's Commerce API returns prices as strings (e.g., "5000.00" for Rs 5000)
+                # The webhook sends prices in smallest currency unit (paisa)
                 api_price = product_details.get("price", "0")
                 webhook_price = item.get("item_price", 0)
 
                 if api_price and api_price != "0":
                     try:
-                        # API price is already in smallest unit (paisa)
-                        # Just convert string to int, don't multiply!
-                        item_price = int(float(api_price))
-                        logger.info(f"Using API price for {item_name}: {item_price} paisa (Rs {item_price/100})")
+                        # Meta API returns price in rupees (e.g., "5000" = Rs 5000)
+                        # We need to convert to paisa for internal storage: multiply by 100
+                        price_in_rupees = float(api_price)
+                        item_price = int(price_in_rupees * 100)  # Convert to paisa
+                        logger.info(f"API price for {item_name}: {api_price} PKR = {item_price} paisa")
                     except Exception as e:
                         logger.warning(f"Failed to parse API price '{api_price}': {e}")
                         item_price = int(webhook_price)
+                        logger.info(f"Using webhook price for {item_name}: {item_price} paisa")
                 else:
-                    # Webhook also sends in smallest unit (paisa)
+                    # Webhook sends in paisa (smallest unit)
                     item_price = int(webhook_price)
-                    logger.info(f"Using webhook price for {item_name}: {item_price} paisa (Rs {item_price/100})")
+                    logger.info(f"Webhook price for {item_name}: {item_price} paisa (Rs {item_price/100})")
             else:
                 # Fallback: Try to extract from webhook (though it usually doesn't have name)
                 item_name = (
@@ -728,20 +729,23 @@ class WhatsAppAPI:
                 products = data.get("data", [])
                 if products:
                     product = products[0]
-                    logger.info(f"Fetched product: {product.get('name')} - {product.get('price')}")
+                    product_name = product.get("name", "Unknown Item")
+                    product_price = product.get("price", "0")
+                    logger.info(f"✅ Fetched from catalogue: {product_name} - Price: '{product_price}' (type: {type(product_price).__name__})")
                     return {
-                        "name": product.get("name", "Unknown Item"),
-                        "price": product.get("price", 0),
+                        "name": product_name,
+                        "price": product_price,
                         "currency": product.get("currency", "PKR"),
                         "image_url": product.get("image_url")
                     }
 
-            logger.warning(f"Could not fetch product details for {product_retailer_id}")
-            return {"name": "Unknown Item", "price": 0}
+            logger.warning(f"❌ Could not fetch product details for retailer_id: {product_retailer_id} from catalogue: {catalog_id}")
+            logger.warning(f"API Response status: {response.status_code}, body: {response.text[:200]}")
+            return {"name": "Unknown Item", "price": "0"}
 
         except Exception as e:
-            logger.error(f"Error fetching product details: {type(e).__name__} - {str(e)}")
-            return {"name": "Unknown Item", "price": 0}
+            logger.error(f"❌ Exception fetching product details for {product_retailer_id}: {type(e).__name__} - {str(e)}")
+            return {"name": "Unknown Item", "price": "0"}
     
     @staticmethod
     def verify_signature(payload: bytes, signature: str) -> bool:
@@ -918,26 +922,18 @@ class BotFlows:
     
     @staticmethod
     async def show_store(to: str):
-        """Show Meta product catalogue."""
+        """Show Meta product catalogue directly."""
         try:
-            # Simply send the catalogue - it opens directly in WhatsApp
+            # Send catalogue message - this opens the catalogue directly in WhatsApp
             await WhatsAppAPI.send_catalogue_message(
                 to,
-                "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and place your order!"
+                "🛍️ Browse our products and add to cart!"
             )
-            # No extra messages - catalogue opens directly!
         except Exception as e:
             logger.error(f"Error showing store: {type(e).__name__} - {str(e)}")
-            # Fallback: inform user
             await WhatsAppAPI.send_text(
                 to,
-                "🛍️ *Our Store*\n\n"
-                "Sorry, I'm having trouble opening the catalogue right now.\n\n"
-                "You can still browse our products by:\n"
-                "1. Tapping the 📎 attachment icon in WhatsApp\n"
-                "2. Selecting 'View Catalogue'\n"
-                "3. Browse and order directly!\n\n"
-                "Or try again in a moment."
+                "❌ Sorry, couldn't open the catalogue. Please try again or contact support."
             )
             await BotFlows.show_home(to)
     
