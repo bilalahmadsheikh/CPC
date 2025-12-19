@@ -774,7 +774,7 @@ class BillingHelper:
     @staticmethod
     def format_currency(amount_paisa: int) -> str:
         """Format amount in paisa to rupees string."""
-        rupees = amount_paisa *100
+        rupees = amount_paisa 
         return f"Rs {rupees:,.0f}"
     
     @staticmethod
@@ -813,7 +813,7 @@ class BillingHelper:
             for idx, item in enumerate(items, 1):
                 name = item.get("name", "Unknown Item")
                 qty = item.get("quantity", 1)
-                price = item.get("item_price", 0)
+                price = item.get("item_price", 0)*100
                 item_total = item.get("item_total", price * qty)
                 
                 bill_lines.append(f"*{idx}. {name}*")
@@ -823,7 +823,7 @@ class BillingHelper:
             # Legacy order with single item
             item_name = order.get("item_name", "Unknown Item")
             quantity = order.get("quantity", 1)
-            item_price = order.get("item_price", 0)*100
+            item_price = order.get("item_price", 0)
             item_total = item_price * quantity 
             
             bill_lines.append(f"*1. {item_name}*")
