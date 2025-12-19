@@ -1605,7 +1605,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             rid = msg["reply_id"]
             
             handlers = {
-                BTN_VIEW_STORE: WhatsAppAPI.send_catalogue_message(to),
+                BTN_VIEW_STORE: WhatsAppAPI.send_catalogue_message(to,"cpc"),
                 BTN_CHECKOUT: lambda: BotFlows.show_checkout(to, wa_id),
                 BTN_HISTORY: lambda: BotFlows.show_history(to, wa_id),
                 BTN_FAQ: lambda: BotFlows.show_faq(to),
