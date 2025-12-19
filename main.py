@@ -328,19 +328,19 @@ class Database:
 
                 if api_price and api_price != "0":
                     try:
-                        # Meta API returns price in rupees (e.g., "5000" = Rs 5000)
-                        # We need to convert to paisa for internal storage: multiply by 100
-                        price_in_rupees = float(api_price)
-                        item_price = int(price_in_rupees * 100)  # Convert to paisa
-                        logger.info(f"API price for {item_name}: {api_price} PKR = {item_price} paisa")
+                        # Meta API returns price as string in rupees (e.g., "5000.00" = Rs 5000)
+                        # Store directly as rupees
+                        item_price = int(float(api_price))
+                        logger.info(f"✅ API price for {item_name}: Rs {item_price} (from API: '{api_price}')")
                     except Exception as e:
                         logger.warning(f"Failed to parse API price '{api_price}': {e}")
+                        # Fallback to webhook price (also in rupees based on your webhook data)
                         item_price = int(webhook_price)
-                        logger.info(f"Using webhook price for {item_name}: {item_price} paisa")
+                        logger.info(f"⚠️ Using webhook price for {item_name}: Rs {item_price}")
                 else:
-                    # Webhook sends in paisa (smallest unit)
+                    # Webhook sends price in rupees (based on your logs showing 5000 = Rs 5000)
                     item_price = int(webhook_price)
-                    logger.info(f"Webhook price for {item_name}: {item_price} paisa (Rs {item_price/100})")
+                    logger.info(f"📦 Webhook price for {item_name}: Rs {item_price}")
             else:
                 # Fallback: Try to extract from webhook (though it usually doesn't have name)
                 item_name = (
