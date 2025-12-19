@@ -813,7 +813,7 @@ class BillingHelper:
             for idx, item in enumerate(items, 1):
                 name = item.get("name", "Unknown Item")
                 qty = item.get("quantity", 1)
-                price = item.get("item_price", 0)*100
+                price = item.get("item_price", 0)
                 item_total = item.get("item_total", price * qty)
                 
                 bill_lines.append(f"*{idx}. {name}*")
