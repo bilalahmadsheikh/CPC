@@ -319,16 +319,27 @@ class Database:
             if product_retailer_id:
                 product_details = await WhatsAppAPI.get_product_details(product_retailer_id, catalog_id)
                 item_name = product_details.get("name", "Unknown Item")
-                # Use API price if webhook price seems wrong (like 5000 paisa = Rs 50)
+
+                # Get price from API or webhook
+                # IMPORTANT: Meta's API and webhook return prices in the smallest currency unit
+                # For PKR: 100 paisa = 1 rupee, so price "500000" = Rs 5000
+                # The API returns it as a string, webhook as integer
                 api_price = product_details.get("price", "0")
-                if api_price:
+                webhook_price = item.get("item_price", 0)
+
+                if api_price and api_price != "0":
                     try:
-                        # Convert API price string to paisa
-                        item_price = int(float(api_price) * 100)
-                    except:
-                        item_price = int(item.get("item_price", 0))
+                        # API price is already in smallest unit (paisa)
+                        # Just convert string to int, don't multiply!
+                        item_price = int(float(api_price))
+                        logger.info(f"Using API price for {item_name}: {item_price} paisa (Rs {item_price/100})")
+                    except Exception as e:
+                        logger.warning(f"Failed to parse API price '{api_price}': {e}")
+                        item_price = int(webhook_price)
                 else:
-                    item_price = int(item.get("item_price", 0))
+                    # Webhook also sends in smallest unit (paisa)
+                    item_price = int(webhook_price)
+                    logger.info(f"Using webhook price for {item_name}: {item_price} paisa (Rs {item_price/100})")
             else:
                 # Fallback: Try to extract from webhook (though it usually doesn't have name)
                 item_name = (
@@ -909,19 +920,12 @@ class BotFlows:
     async def show_store(to: str):
         """Show Meta product catalogue."""
         try:
+            # Simply send the catalogue - it opens directly in WhatsApp
             await WhatsAppAPI.send_catalogue_message(
                 to,
                 "🛍️ *Browse Our Store*\n\nCheck out our complete product catalogue below. Tap on any item to view details and place your order!"
             )
-            
-            await asyncio.sleep(1)
-            await WhatsAppAPI.send_buttons(
-                to,
-                "Need help with anything else?",
-                [
-                    {"id": BTN_BACK_HOME, "title": "🏠 Main Menu"},
-                ],
-            )
+            # No extra messages - catalogue opens directly!
         except Exception as e:
             logger.error(f"Error showing store: {type(e).__name__} - {str(e)}")
             # Fallback: inform user
