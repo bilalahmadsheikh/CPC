@@ -728,21 +728,45 @@ class WhatsAppAPI:
             if response.status_code == 200:
                 data = response.json()
 
-                # Log the FULL API response for debugging
-                logger.info(f"🔍 Full API response for {product_retailer_id}: {json.dumps(data, indent=2)}")
+                # Meta API returns ALL products in a "data" array, not just the specific one
+                # We need to find the matching product by retailer_id
+                products = data.get("data", [])
 
-                # Direct product fetch returns the product object directly
-                product_name = data.get("name", "Unknown Item")
-                product_price = data.get("price", "0")
+                if not products:
+                    logger.warning(f"❌ API returned empty data array for {product_retailer_id}")
+                    return {"name": "Unknown Item", "price": "0"}
 
-                # Log what we extracted
-                logger.info(f"✅ Extracted: name='{product_name}', price='{product_price}'")
+                # Find the product with matching retailer_id
+                product = None
+                for p in products:
+                    if p.get("retailer_id") == product_retailer_id:
+                        product = p
+                        break
+
+                if not product:
+                    logger.warning(f"❌ Product {product_retailer_id} not found in API response")
+                    return {"name": "Unknown Item", "price": "0"}
+
+                # Extract product details
+                product_name = product.get("name", "Unknown Item")
+                product_price_raw = product.get("price", "0")
+
+                # Price format is "PKR5,000.00" - need to extract just the number
+                # Remove "PKR" prefix and commas, then parse
+                try:
+                    price_clean = product_price_raw.replace("PKR", "").replace(",", "").strip()
+                    product_price = str(int(float(price_clean)))  # Convert to integer string
+                except:
+                    product_price = "0"
+                    logger.warning(f"Failed to parse price: '{product_price_raw}'")
+
+                logger.info(f"✅ Found product: {product_name} - Price: {product_price_raw} → Rs {product_price}")
 
                 return {
                     "name": product_name,
                     "price": product_price,
-                    "currency": data.get("currency", "PKR"),
-                    "image_url": data.get("image_url")
+                    "currency": product.get("currency", "PKR"),
+                    "image_url": product.get("image_url")
                 }
 
             logger.warning(f"❌ Could not fetch product details for retailer_id: {product_retailer_id} from catalogue: {catalog_id}")
