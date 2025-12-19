@@ -656,6 +656,7 @@ class WhatsAppAPI:
             if not config.CATALOGUE_ID:
                 raise RuntimeError("CATALOGUE_ID is not configured")
 
+            # Use the catalog_message action to open the entire catalogue
             payload = {
                 "messaging_product": "whatsapp",
                 "recipient_type": "individual",
@@ -667,10 +668,7 @@ class WhatsAppAPI:
                         "text": body_text
                     },
                     "action": {
-                        "name": "catalog_message",
-                        "parameters": {
-                            "thumbnail_product_retailer_id": config.CATALOGUE_ID
-                        }
+                        "name": "catalog_message"
                     }
                 }
             }
@@ -930,11 +928,12 @@ class BotFlows:
             await WhatsAppAPI.send_text(
                 to,
                 "🛍️ *Our Store*\n\n"
-                "To view our products:\n"
-                "1. Tap the 📎 attachment icon\n"
-                "2. Select 'Product Catalogue'\n"
-                "3. Browse and order!\n\n"
-                "Or visit our website: www.cpc.com"
+                "Sorry, I'm having trouble opening the catalogue right now.\n\n"
+                "You can still browse our products by:\n"
+                "1. Tapping the 📎 attachment icon in WhatsApp\n"
+                "2. Selecting 'View Catalogue'\n"
+                "3. Browse and order directly!\n\n"
+                "Or try again in a moment."
             )
             await BotFlows.show_home(to)
     
