@@ -824,8 +824,8 @@ class BillingHelper:
             # Legacy order with single item
             item_name = order.get("item_name", "Unknown Item")
             quantity = order.get("quantity", 1)
-            item_price = order.get("item_price", 0)
-            item_total = item_price * quantity
+            item_price = order.get("item_price", 0)*100
+            item_total = item_price * quantity 
             
             bill_lines.append(f"*1. {item_name}*")
             bill_lines.append(f"   Qty: {quantity} × {BillingHelper.format_currency(item_price)} = {BillingHelper.format_currency(item_total)}")
